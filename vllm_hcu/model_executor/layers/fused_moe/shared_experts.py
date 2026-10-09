@@ -50,6 +50,7 @@ class SharedExperts(torch.nn.Module):
         moe_config: FusedMoEConfig,
         enable_dbo: bool,
         mk_can_overlap_shared_experts: Callable[[], bool],
+        is_multistream_safe: Callable[[], bool],
     ):
         super().__init__()
 
@@ -68,6 +69,7 @@ class SharedExperts(torch.nn.Module):
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
+        self._is_multistream_safe = is_multistream_safe
 
         self._step5_decode_only = (
             os.environ.get("VLLM_STEP5_SHARED_EXPERTS_DECODE_ONLY", "0") == "1"
@@ -291,7 +293,11 @@ class SharedExperts(torch.nn.Module):
         should_run_shared_in_aux_stream = self._should_run_shared_in_aux_stream(
             hidden_states
         )
-        if force_stream and should_run_shared_in_aux_stream:
+        if (
+            force_stream
+            and should_run_shared_in_aux_stream
+            and self._is_multistream_safe()
+        ):
             if getattr(self, "_step5_decode_only", False):
                 logger.info_once(
                     "Step5 decode-only shared experts selected the auxiliary stream",
@@ -302,7 +308,7 @@ class SharedExperts(torch.nn.Module):
         if self._mk_can_overlap_shared_experts():
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
-        if should_run_shared_in_aux_stream:
+        if should_run_shared_in_aux_stream and self._is_multistream_safe():
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         return SharedExpertsOrder.NO_OVERLAP
 

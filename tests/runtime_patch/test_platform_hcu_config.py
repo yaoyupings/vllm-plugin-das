@@ -1179,6 +1179,85 @@ def test_deepep_auto_rejects_non_dp_ep_topology_before_model_loading(
         patch_vllm_config.validate_and_update_hcu_config(config)
 
 
+def test_deepseek_v4_dspark_draft_clone_reuses_target_deepep_topology() -> None:
+    target_parallel = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_eplb=False,
+        use_ubatching=False,
+    )
+    draft_parallel = SimpleNamespace(
+        all2all_backend="allgather_reducescatter",
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+    target_additional = {
+        "hcu": HcuFeatureConfig(deepep_auto=True).to_dict(),
+        "unrelated": {"keep": True},
+    }
+    config = _validation_config(HcuFeatureConfig())
+    # vllm.config.replace() retains the target's additional_config object when
+    # it swaps in SpeculativeConfig.draft_parallel_config for DSpark.
+    config.additional_config = target_additional
+    config.parallel_config = draft_parallel
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        target_parallel_config=target_parallel,
+        draft_parallel_config=draft_parallel,
+    )
+
+    resolved = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert resolved.deepep_auto is True
+    assert get_hcu_config(config).deepep_auto is True
+    assert config.parallel_config is target_parallel
+    assert target_parallel._vllm_hcu_deepep_auto is True
+    assert not hasattr(draft_parallel, "_vllm_hcu_deepep_auto")
+    assert config.additional_config is target_additional
+    assert config.additional_config["unrelated"] == {"keep": True}
+    assert get_hcu_config(target_additional).deepep_auto is True
+
+
+def test_deepseek_v4_dspark_deepep_rejects_mismatched_draft_tp() -> None:
+    target_parallel = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_eplb=False,
+        use_ubatching=False,
+    )
+    draft_parallel = SimpleNamespace(
+        all2all_backend="allgather_reducescatter",
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.parallel_config = draft_parallel
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        target_parallel_config=target_parallel,
+        draft_parallel_config=draft_parallel,
+    )
+
+    with pytest.raises(ValueError, match="draft_tp=2, target_tp=4"):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
 def test_deepep_auto_rejects_ubatching_before_model_loading() -> None:
     config = _validation_config(HcuFeatureConfig(deepep_auto=True))
     config.parallel_config.all2all_backend = "deepep_low_latency"
@@ -1208,6 +1287,27 @@ def test_deepseek_v4_dspark_allows_mooncake_pd_before_model_loading() -> None:
     patch_vllm_config.validate_and_update_hcu_config(
         _dspark_pd_config("MooncakeConnector")
     )
+
+
+def test_deepseek_v4_enables_breakable_cuda_graph_by_default() -> None:
+    variable = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+    original = os.environ.get(variable)
+    with pytest.MonkeyPatch.context() as environment:
+        # Seed then delete so MonkeyPatch records how to restore an initially
+        # absent variable after the code under test writes it directly.
+        environment.setenv(variable, "test-restore-sentinel")
+        environment.delenv(variable)
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+                enforce_eager=False,
+            )
+        )
+
+        patch_vllm_config._normalize_hcu_breakable_cudagraph(config)
+
+        assert os.environ[variable] == "1"
+    assert os.environ.get(variable) == original
 
 
 @pytest.mark.parametrize("connector", ["NixlConnector", "ExampleConnector"])
@@ -1653,6 +1753,36 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     assert config.cache_config.block_size == 64
 
 
+def test_sparse_cache_normalization_tolerates_missing_attention_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = _validation_config(HcuFeatureConfig())
+    config.compilation_config.cudagraph_mode = SimpleNamespace(
+        has_full_cudagraphs=lambda: False
+    )
+    config.parallel_config.worker_cls = "custom"
+    config.parallel_config.distributed_executor_backend = "uni"
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=True,
+        block_size=64,
+        cache_dtype="fp8_e4m3",
+    )
+    config.attention_config = None
+    monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "validate_and_update_hcu_config",
+        lambda vllm_config: HcuFeatureConfig(),
+    )
+
+    HCUPlatform.check_and_update_config(config)
+
+    assert config.cache_config.cache_dtype == "fp8_e4m3"
+
+
 def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1673,6 +1803,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     config.cache_config = SimpleNamespace(
         user_specified_block_size=False,
         block_size=16,
+        cache_dtype="fp8_e4m3",
         kv_cache_dtype_skip_layers=[],
     )
     config.attention_config = SimpleNamespace(
@@ -1689,6 +1820,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     HCUPlatform.check_and_update_config(config)
 
     assert config.cache_config.block_size == 64
+    assert config.cache_config.cache_dtype == "fp8_ds_mla"
 
     config.cache_config.block_size = 16
 
@@ -1756,6 +1888,43 @@ def test_sparse_flashmla_preserves_upstream_hybrid_block_alignment(
     HCUPlatform.update_block_size_for_backend(config)
 
     assert config.cache_config.block_size == 1152
+
+
+def test_deepseek_v4_aligns_explicit_block_with_sparse_backend_and_compressor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = _validation_config(HcuFeatureConfig())
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=True,
+        block_size=64,
+        kv_cache_dtype_skip_layers=[],
+    )
+    config.attention_config = SimpleNamespace(
+        backend=AttentionBackendEnum.FLASHMLA_SPARSE
+    )
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.model_config.hf_config = SimpleNamespace(
+        compress_ratios=[0, 4, 128, 4, 128]
+    )
+    config.model_config.is_hybrid = False
+
+    class FlashMLABackend:
+        @staticmethod
+        def get_name():
+            return "FLASHMLA_SPARSE"
+
+    monkeypatch.setattr(
+        HCUPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: FlashMLABackend),
+    )
+
+    HCUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 256
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,20 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _num_workspace_lanes(
+    vllm_config: VllmConfig,
+    use_v2_model_runner: bool,
+) -> int:
+    spec_config = vllm_config.speculative_config
+    return (
+        2
+        if use_v2_model_runner
+        and spec_config is not None
+        and spec_config.use_dspark()
+        else 1
+    )
+
+
 def _create_model_runner(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -41,6 +55,19 @@ def _create_model_runner(
     runner = HcuGPUModelRunnerV2(vllm_config, device)
     runner_logger.info("HCU model runner constructed: %s", type(runner).__name__)
     return runner
+
+
+def _init_hcu_workspace_manager(
+    vllm_config: VllmConfig,
+    device: torch.device,
+    *,
+    use_v2_model_runner: bool,
+) -> None:
+    """Match MRV2's independent target/draft workspace ownership."""
+
+    num_ubatches = 2 if vllm_config.parallel_config.enable_dbo else 1
+    num_lanes = _num_workspace_lanes(vllm_config, use_v2_model_runner)
+    init_workspace_manager(device, num_ubatches, num_lanes)
 
 
 class HcuGPUWorker(Worker):
@@ -190,9 +217,11 @@ class HcuGPUWorker(Worker):
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-        # Initialize workspace manager
-        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
-        init_workspace_manager(self.device, num_ubatches)
+        _init_hcu_workspace_manager(
+            self.vllm_config,
+            self.device,
+            use_v2_model_runner=self.use_v2_model_runner,
+        )
 
         # Construct the model runner
         self.model_runner: GPUModelRunner = _create_model_runner(  # type: ignore

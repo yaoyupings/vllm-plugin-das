@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: bool = True
     VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_AWQ: bool = False
+    VLLM_HCU_INDEXER_KCACHE_LAYOUT: str = "preshuffle"
     VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND: str = "flashmla"
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 16384
@@ -125,6 +129,32 @@ def lightop_awq_enabled() -> bool:
     return optional_custom_op_enabled(
         _environment_flag(os.environ.get("VLLM_HCU_USE_LIGHTOP_AWQ", "False"))
     )
+
+
+INDEXER_KCACHE_LAYOUT_ENV = "VLLM_HCU_INDEXER_KCACHE_LAYOUT"
+INDEXER_KCACHE_LAYOUTS = ("preshuffle", "normal")
+
+
+def indexer_kcache_layout() -> str:
+    """Resolve the gfx938 GLM5Next sparse-indexer K-cache page layout.
+
+    ``preshuffle`` keeps the official 16x16 tiled KPool pages, decoded by the
+    HCU Triton direct reader. ``normal`` writes token-major pages and decodes
+    them with LightOp ``paged_mqa_logits``. The layout is part of the KV-cache
+    contents, so every rank and every disaggregated prefill/decode peer must
+    use the same value. Disabling the HCU custom-op master switch always keeps
+    the official ``preshuffle`` layout.
+    """
+
+    raw = os.environ.get(INDEXER_KCACHE_LAYOUT_ENV, "preshuffle").strip().lower()
+    if raw not in INDEXER_KCACHE_LAYOUTS:
+        raise ValueError(
+            f"{INDEXER_KCACHE_LAYOUT_ENV} must be one of "
+            f"{INDEXER_KCACHE_LAYOUTS}, got {raw!r}"
+        )
+    if not custom_ops_enabled():
+        return "preshuffle"
+    return raw
 
 
 def ple_prefetch_enabled() -> bool:
@@ -358,6 +388,21 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_TILELANG_MHC_PRENORM", "True").lower() in
                     ("true", "1")),
 
+    # FlashMLA sparse attention for native ROCm DeepSeek-V4.
+    # Both adapter paths also require VLLM_HCU_USE_CUSTOM_OPS; disabling
+    # the master retains the original ROCm/AITER attention and metadata builders.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE":
+        lambda: os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", "True").lower()
+        in ("true", "1"),
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL":
+        lambda: os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", "True").lower()
+        in ("true", "1"),
+    # Provider selection applies only to this adapter's prefill path.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND":
+        lambda: os.environ.get(
+            "VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND", "flashmla"
+        ).strip().lower(),
+
     # Whether to route DeepSeek V4 ROCm decode through the legacy fallback.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK":
         lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK", "False").lower() in
@@ -515,6 +560,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         ple_prefetch_enabled,
+
+    # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
+    # (official 16x16 tiles, HCU Triton decode reader) or "normal"
+    # (token-major pages, LightOp decode reader).
+    "VLLM_HCU_INDEXER_KCACHE_LAYOUT":
+        indexer_kcache_layout,
 }
 
 # end-env-vars-definition

@@ -203,6 +203,7 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_utils")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_unquantized_oracle")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_int8_oracle")),
+    _CallbackSpec(_adapter("op_opt.moe", "patch_wna16_oracle")),
     _CallbackSpec(
         _adapter("op_opt.moe", "patch_fp8_oracle"),
         feature="deep_gemm",
@@ -212,15 +213,24 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
+    _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_aiter_cache")),
+    _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_sparse_decode")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_attention")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_bf16_compressor")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
+    _CallbackSpec(
+        _adapter("core_fix", "patch_deepseek_v4_rocm_compressor_fusion")
+    ),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_bf16_cache")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_flashmla_sparse")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mtp_shared_gate")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl_moe")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp")),

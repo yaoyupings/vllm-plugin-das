@@ -175,12 +175,28 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """Apply the layer's compressed linear scheme."""
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
+        supports = getattr(scheme, "supports_quanted_inputs", None)
+        if (
+            x_and_scale_quanted is not None
+            and callable(supports)
+            and bool(supports())
+        ):
+            return scheme.apply_weights(
+                layer,
+                x,
+                bias=bias,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         return scheme.apply_weights(layer, x, bias=bias)
+
+    def supports_quanted_inputs(self) -> bool:
+        return True
 
 
 _SLIMQUANT_MOE_LAYOUT_TENSORS = (
@@ -221,20 +237,22 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig:
-        # The checkpoint scales target SlimQuant's high-nibble INT8 domain.
-        # AITER and the vLLM fallback consume signed INT4 values after unpack,
-        # so compensate for the four-bit shift without mutating checkpoint
-        # parameters used as the canonical cache owners.
+        # Keep the checkpoint scale as the canonical value.  The AITER MOE_C
+        # shuffled representation already accounts for the packed INT4
+        # high-nibble convention.  The explicit Triton fallback applies its
+        # separate x16 conversion at the call site instead of changing this
+        # shared configuration.
         self.moe_quant_config = FusedMoEQuantConfig.make(
             torch.int8,
-            w1_scale=layer.w13_weight_scale * 16.0,
-            w2_scale=layer.w2_weight_scale * 16.0,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             per_act_token_quant=True,
             per_out_ch_quant=False,
             block_shape=None,
             weight_dtype="int4",
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
         return self.moe_quant_config
 
@@ -255,6 +273,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             per_out_ch_quant=False,
             block_shape=None,
             weight_dtype="int4",
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
 
     @property

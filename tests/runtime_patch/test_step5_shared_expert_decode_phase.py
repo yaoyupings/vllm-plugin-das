@@ -20,13 +20,15 @@ def test_missing_descriptor_does_not_enable_overlap():
     assert not is_short_uniform_decode(None)
     assert not is_short_uniform_decode(NS(batch_descriptor=None))
 
-@pytest.mark.parametrize("uniform,can_mk,expected", [
-    (False,True,SharedExpertsOrder.MK_INTERNAL_OVERLAPPED),
-    (False,False,SharedExpertsOrder.NO_OVERLAP),
-    (True,True,SharedExpertsOrder.MULTI_STREAM_OVERLAPPED),
-    (True,False,SharedExpertsOrder.MULTI_STREAM_OVERLAPPED),
+@pytest.mark.parametrize("uniform,can_mk,multistream_safe,expected", [
+    (False,True,True,SharedExpertsOrder.MK_INTERNAL_OVERLAPPED),
+    (False,False,True,SharedExpertsOrder.NO_OVERLAP),
+    (True,True,True,SharedExpertsOrder.MULTI_STREAM_OVERLAPPED),
+    (True,False,True,SharedExpertsOrder.MULTI_STREAM_OVERLAPPED),
+    (True,True,False,SharedExpertsOrder.MK_INTERNAL_OVERLAPPED),
+    (True,False,False,SharedExpertsOrder.NO_OVERLAP),
 ])
-def test_phase_guard_limits_aux_stream_and_preserves_native_mk(monkeypatch,uniform,can_mk,expected):
+def test_phase_guard_limits_aux_stream_and_preserves_native_mk(monkeypatch,uniform,can_mk,multistream_safe,expected):
     from vllm_hcu.model_executor.layers.fused_moe import shared_experts as module
     import vllm.forward_context
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS","1")
@@ -42,6 +44,7 @@ def test_phase_guard_limits_aux_stream_and_preserves_native_mk(monkeypatch,unifo
     item._step5_decode_only=True
     item._stream=object()
     item._mk_can_overlap_shared_experts=lambda:can_mk
+    item._is_multistream_safe=lambda:multistream_safe
     item._moe_config=NS(moe_parallel_config=NS(enable_eplb=False,use_fi_nvl_two_sided_kernels=False))
     assert item._determine_shared_experts_order(torch.empty(64,8))==expected
 
@@ -73,7 +76,7 @@ def test_native_aux_stream_and_graph_preserve_outputs(monkeypatch,uniform,captur
         torch.nn.Linear(1536,4096,bias=False),
     ).cuda().bfloat16()
     item=SharedExperts(layer,NS(moe_parallel_config=NS(
-        enable_eplb=False,use_fi_nvl_two_sided_kernels=False)),False,lambda:False)
+        enable_eplb=False,use_fi_nvl_two_sided_kernels=False)),False,lambda:False,lambda:True)
     x=torch.randn(64,4096,device="cuda",dtype=torch.bfloat16)
     out=torch.empty_like(x)
     routed=torch.empty_like(x)

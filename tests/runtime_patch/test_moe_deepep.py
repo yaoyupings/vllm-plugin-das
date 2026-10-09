@@ -67,6 +67,48 @@ def _module(name: str, **attributes: object) -> ModuleType:
     return module
 
 
+def _fake_triton_wna16_experts_class():
+    class TritonWNA16Experts:
+        def apply(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        ):
+            del (
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                expert_map,
+                a1q_scale,
+                a2_scale,
+                workspace13,
+                workspace2,
+                expert_tokens_meta,
+                apply_router_weight_on_input,
+            )
+            return "upstream-wna16"
+
+    return TritonWNA16Experts
+
+
 def _install_lightop_moe(
     monkeypatch: pytest.MonkeyPatch, **exports: object
 ) -> ModuleType:
@@ -1198,6 +1240,7 @@ def test_aiter_and_triton_expert_capability_contract(
         kInt8StaticChannelSym=weight_key,
         kInt8DynamicTokenSym=activation_key,
         TritonExperts=TritonExperts,
+        TritonWNA16Experts=_fake_triton_wna16_experts_class(),
     )
     assert patch_triton_moe.apply_to_module(triton_module) is True
     assert TritonExperts._supports_quant_scheme(weight_key, activation_key) is True
@@ -1276,10 +1319,14 @@ def test_fused_moe_aiter_feature_gate_and_obsolete_contract(
         None, [128, 128], None, None,
     )
 
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", False, raising=False
+    )
     assert module.fused_experts_impl(*arguments) == "official"
 
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False
+    )
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W4A16_MOE", True)
     monkeypatch.setitem(sys.modules, "aiter", ModuleType("aiter"))
     monkeypatch.delitem(sys.modules, "aiter.moe", raising=False)
@@ -1959,6 +2006,7 @@ def test_triton_moe_rebinds_hcu_moe_alignment(
     triton_module = _module(
         patch_triton_moe.TARGET_MODULE,
         TritonExperts=TritonExperts,
+        TritonWNA16Experts=_fake_triton_wna16_experts_class(),
         current_platform=SimpleNamespace(is_rocm=lambda: False),
         kInt8StaticChannelSym=object(),
         kInt8DynamicTokenSym=object(),
@@ -1967,6 +2015,203 @@ def test_triton_moe_rebinds_hcu_moe_alignment(
 
     assert patch_triton_moe.apply_to_module(triton_module) is True
     assert triton_module.moe_align_block_size is align_module.moe_align_block_size
+
+
+def test_triton_wna16_channel_uses_aiter_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class TritonExperts:
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+    TritonWNA16Experts = _fake_triton_wna16_experts_class()
+    triton_module = _module(
+        patch_triton_moe.TARGET_MODULE,
+        TritonExperts=TritonExperts,
+        TritonWNA16Experts=TritonWNA16Experts,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        kInt8StaticChannelSym=object(),
+        kInt8DynamicTokenSym=object(),
+        moe_align_block_size=lambda *args, **kwargs: None,
+    )
+    patch_triton_moe.apply_to_module(triton_module)
+    calls: list[dict[str, object]] = []
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+
+    def fake_apply(**kwargs):
+        calls.append(kwargs)
+        return torch.full_like(kwargs["hidden_states"], 7)
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_w4a16_moe",
+        fake_apply,
+        raising=False,
+    )
+    experts = TritonWNA16Experts()
+    experts.quant_config = SimpleNamespace(
+        use_int4_w4a16=True,
+        block_shape=[0, 64],
+        _hcu_channel_w4a16=True,
+        _hcu_aiter_w4a16_available=True,
+        w1_scale=torch.ones(2, 8, 1),
+        w2_scale=torch.ones(2, 4, 1),
+        w1_zp=torch.full((2, 4, 1), 0x88, dtype=torch.uint8),
+        w2_zp=torch.full((2, 2, 1), 0x88, dtype=torch.uint8),
+    )
+    experts.moe_config = SimpleNamespace(moe_backend="aiter")
+    output = torch.zeros(3, 4)
+    hidden = torch.ones(3, 4)
+    w1 = torch.ones(2, 8, 2, dtype=torch.uint8)
+    w2 = torch.ones(2, 4, 4, dtype=torch.uint8)
+    topk_weights = torch.ones(3, 1)
+    topk_ids = torch.zeros(3, 1, dtype=torch.int32)
+
+    result = experts.apply(
+        output,
+        hidden,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        SimpleNamespace(value="silu"),
+        2,
+        None,
+        None,
+        None,
+        torch.empty(0),
+        torch.empty(0),
+        None,
+        False,
+    )
+
+    assert result is None
+    assert torch.all(output == 7)
+    assert len(calls) == 1
+    assert calls[0]["quant_config"] is experts.quant_config
+    assert calls[0]["vllm_moe_config"] is experts.moe_config
+
+    experts.quant_config._hcu_aiter_w4a16_available = False
+    assert (
+        experts.apply(
+            output,
+            hidden,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            SimpleNamespace(value="silu"),
+            2,
+            None,
+            None,
+            None,
+            torch.empty(0),
+            torch.empty(0),
+            None,
+            False,
+        )
+        == "upstream-wna16"
+    )
+    assert len(calls) == 1
+
+
+def test_triton_wna16_channel_falls_back_when_runtime_m_has_no_aiter_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+
+    class MoeQuantType:
+        W4A16 = "w4a16"
+
+    selected_m: list[int] = []
+
+    def select_config(**kwargs):
+        selected_m.append(kwargs["M"])
+        if kwargs["M"] == 1:
+            return True, SimpleNamespace(need_shuffle=False)
+        return False, None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=select_config,
+        ),
+    )
+
+    class TritonExperts:
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key):
+            del weight_key, activation_key
+            return False
+
+    TritonWNA16Experts = _fake_triton_wna16_experts_class()
+    triton_module = _module(
+        patch_triton_moe.TARGET_MODULE,
+        TritonExperts=TritonExperts,
+        TritonWNA16Experts=TritonWNA16Experts,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        kInt8StaticChannelSym=object(),
+        kInt8DynamicTokenSym=object(),
+        moe_align_block_size=lambda *args, **kwargs: None,
+    )
+    patch_triton_moe.apply_to_module(triton_module)
+
+    w1 = torch.zeros(2, 8, 2, dtype=torch.uint8)
+    w2 = torch.zeros(2, 4, 4, dtype=torch.uint8)
+    moe_config = SimpleNamespace(
+        experts_per_token=1,
+        hidden_dim=4,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+        moe_backend="aiter",
+    )
+    quant_config = SimpleNamespace(
+        use_int4_w4a16=True,
+        block_shape=[0, 4],
+        _hcu_channel_w4a16=True,
+        _hcu_aiter_w4a16_available=False,
+    )
+    compressed_tensors_moe_runtime.prewarm_aiter_w4a16_moe(
+        SimpleNamespace(moe=moe_config),
+        SimpleNamespace(w13_weight_packed=w1, w2_weight_packed=w2),
+        quant_config,
+    )
+    assert quant_config._hcu_aiter_w4a16_available is True
+
+    experts = TritonWNA16Experts()
+    experts.quant_config = quant_config
+    experts.moe_config = moe_config
+    output = torch.zeros(2, 4, dtype=torch.bfloat16)
+    hidden = torch.ones(2, 4, dtype=torch.bfloat16)
+    result = experts.apply(
+        output,
+        hidden,
+        w1,
+        w2,
+        torch.ones(2, 1),
+        torch.zeros(2, 1, dtype=torch.int32),
+        moe_config.activation,
+        2,
+        None,
+        None,
+        None,
+        torch.empty(0),
+        torch.empty(0),
+        None,
+        False,
+    )
+
+    assert result == "upstream-wna16"
+    assert selected_m == [1, 2]
 
 
 def test_fused_moe_rebinds_hcu_moe_alignment(
@@ -3818,6 +4063,207 @@ def test_slimquant_w4a8_auto_reload_pack_failure_leaves_repacking_marker(
     assert len(reload_pack_calls) == 2
 
 
+def test_slimquant_w4a8_contiguous_experts_apply_swiglu_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.quantization import (
+        slimquant_w4a8_deepgemm_runtime as runtime,
+    )
+
+    experts = object.__new__(runtime.DeepEPDeepGemmW4A8ContiguousExperts)
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.ones((1, 8), dtype=torch.float32),
+        w2_scale=torch.ones((1, 4), dtype=torch.float32),
+        block_shape=None,
+        gemm1_clamp_limit=10.0,
+    )
+    experts._deepgemm_w13 = torch.empty((1, 1), dtype=torch.int8)
+    experts._deepgemm_w2 = torch.empty((1, 1), dtype=torch.int8)
+    experts.moe_problem_size = lambda *_args: (1, 2, 8, 4, 1)
+
+    monkeypatch.setattr(runtime, "compute_aligned_M", lambda **_kwargs: 2)
+    monkeypatch.setattr(
+        runtime,
+        "deepgemm_moe_permute",
+        lambda **kwargs: (
+            kwargs["aq"],
+            kwargs["aq_scale"],
+            torch.zeros(2, dtype=torch.int32),
+            torch.arange(2, dtype=torch.int32),
+            256,
+        ),
+    )
+    gemm_calls = 0
+
+    def grouped_gemm(_a, _b, destination, _m_indices):
+        nonlocal gemm_calls
+        gemm_calls += 1
+        destination.fill_(gemm_calls)
+
+    monkeypatch.setattr(
+        runtime,
+        "m_grouped_w4a8_gemm_nt_contiguous_hipc",
+        grouped_gemm,
+    )
+    clamp_kwargs: dict[str, object] = {}
+
+    def clamp_quant(value, **kwargs):
+        clamp_kwargs.update(kwargs)
+        output = kwargs["output"]
+        output.fill_(3)
+        return output, torch.ones((value.size(0), 1))
+
+    monkeypatch.setattr(
+        runtime,
+        "fuse_silu_mul_clamp_quant",
+        clamp_quant,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "fuse_silu_mul_quant",
+        lambda *_args, **_kwargs: pytest.fail("unclamped activation used"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "deepgemm_unpermute_and_reduce",
+        lambda *, a, output, **_kwargs: output.copy_(a),
+    )
+
+    output = torch.empty((2, 4), dtype=torch.float32)
+    experts.apply(
+        output=output,
+        hidden_states=torch.ones((2, 4), dtype=torch.int8),
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=torch.ones((2, 1)),
+        a2_scale=None,
+        workspace13=torch.empty(64, dtype=torch.int8),
+        workspace2=torch.empty(32, dtype=torch.float32),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert gemm_calls == 2
+    assert clamp_kwargs["limit"] == 10.0
+
+
+def test_slimquant_w4a8_batched_experts_apply_swiglu_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        batched_deep_gemm_moe as runtime,
+    )
+
+    experts = object.__new__(runtime.BatchedDeepGemmExperts)
+    experts.quant_config = SimpleNamespace(
+        w1_scale=torch.ones((1, 8), dtype=torch.float32),
+        w2_scale=torch.ones((1, 4), dtype=torch.float32),
+        block_shape=None,
+        weight_quant_dtype="int4",
+        gemm1_clamp_limit=10.0,
+        use_int8_w8a8=False,
+        use_fp8_w8a8=False,
+    )
+    experts._deepgemm_w13 = torch.empty((1, 1), dtype=torch.int8)
+    experts._deepgemm_w2 = torch.empty((1, 1), dtype=torch.int8)
+    experts._hcu_logical_n = 8
+    experts._hcu_logical_k = 4
+    experts.moe_problem_size = lambda *_args: (1, 2, 8, 4, 1)
+    experts.estimate_expected_m = lambda **_kwargs: 2
+    monkeypatch.setattr(
+        runtime.current_platform,
+        "is_rocm",
+        lambda: True,
+    )
+
+    gemm_calls = 0
+
+    def grouped_gemm(_a, _b, destination, _mask, _expected_m):
+        nonlocal gemm_calls
+        gemm_calls += 1
+        destination.fill_(gemm_calls)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "deepgemm",
+        _module(
+            "deepgemm",
+            m_grouped_w4a8_gemm_nt_masked_hipc=grouped_gemm,
+        ),
+    )
+    clamp_kwargs: dict[str, object] = {}
+
+    def clamp_quant(value, **kwargs):
+        clamp_kwargs.update(kwargs)
+        return (
+            torch.zeros((1, 2, 4), dtype=torch.int8),
+            torch.ones((1, 2), dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "fuse_silu_mul_clamp_quant_ep",
+        clamp_quant,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "fuse_silu_mul_quant_ep",
+        lambda *_args, **_kwargs: pytest.fail("unclamped activation used"),
+        raising=False,
+    )
+    activation_module = _module(
+        "lightop.activation",
+        fuse_silu_mul_quant_ep=lambda *_args, **_kwargs: pytest.fail(
+            "unclamped activation used"
+        ),
+    )
+    lightop_module = _module(
+        "lightop",
+        fuse_silu_mul_clamp_quant_ep=clamp_quant,
+    )
+    lightop_module.__path__ = []
+    lightop_module.activation = activation_module
+    monkeypatch.setitem(sys.modules, "lightop", lightop_module)
+    monkeypatch.setitem(sys.modules, "lightop.activation", activation_module)
+
+    expert_num_tokens = torch.tensor([2], dtype=torch.int32)
+    experts.apply(
+        output=torch.empty((1, 2, 4), dtype=torch.float32),
+        hidden_states=torch.ones((1, 2, 4), dtype=torch.int8),
+        w1=experts._deepgemm_w13,
+        w2=experts._deepgemm_w2,
+        topk_weights=torch.ones((2, 1)),
+        topk_ids=torch.zeros((2, 1), dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=torch.ones((1, 2)),
+        a2_scale=None,
+        workspace13=torch.empty(64, dtype=torch.int8),
+        workspace2=torch.empty(32, dtype=torch.float32),
+        expert_tokens_meta=SimpleNamespace(
+            expert_num_tokens=expert_num_tokens,
+        ),
+        apply_router_weight_on_input=False,
+    )
+
+    assert gemm_calls == 2
+    assert clamp_kwargs == {
+        "limit": 10.0,
+        "mask_m": expert_num_tokens,
+        "expect_m": 2,
+    }
+
+
 def test_channel_int8_auto_factory_builds_unified_ht_ll_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3927,6 +4373,7 @@ def test_slimquant_w4a8_auto_factory_reuses_unified_prepare_finalize(
         per_out_ch_quant=False,
         block_shape=None,
         weight_dtype="int4",
+        gemm1_clamp_limit=10.0,
     )
     moe_config = SimpleNamespace()
 

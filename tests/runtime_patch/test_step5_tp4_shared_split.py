@@ -50,7 +50,7 @@ def test_constructor_profiles_and_sidecar_fallback(setup,tp,dp,dcp,auto):
     cfg,ctx,pc=setup; p=cfg.parallel_config
     p.tensor_parallel_size=tp;p.data_parallel_size=dp;p.decode_context_parallel_size=dcp
     cfg.additional_config["hcu"]["deepep_auto"]=auto
-    item=SharedExperts(Layer([]),NS(moe_parallel_config=pc),False,lambda:True)
+    item=SharedExperts(Layer([]),NS(moe_parallel_config=pc),False,lambda:True,lambda:True)
     assert item._step5_split_auto is auto
 
 @pytest.mark.parametrize("field,value",[
@@ -61,7 +61,7 @@ def test_constructor_profiles_and_sidecar_fallback(setup,tp,dp,dcp,auto):
 def test_reject_unsupported_profiles(setup,field,value):
     cfg,ctx,pc=setup;setattr(cfg.parallel_config,field,value)
     with pytest.raises(ValueError):
-        SharedExperts(Layer([]),NS(moe_parallel_config=pc),False,lambda:True)
+        SharedExperts(Layer([]),NS(moe_parallel_config=pc),False,lambda:True,lambda:True)
 
 @pytest.mark.parametrize("auto_ll,uniform,m,prequant,expected",[
     (True,True,2,False,True),(True,True,4,False,True),
@@ -73,7 +73,7 @@ def test_global_phase_and_split_state(setup,auto_ll,uniform,m,prequant,expected)
     cfg,ctx,pc=setup;ctx.deepep_auto_use_low_latency=auto_ll
     ctx.batch_descriptor=BatchDescriptor(max(1,m)*4,max(1,m),uniform)
     events=[];layer=Layer(events)
-    item=SharedExperts(layer,NS(moe_parallel_config=pc),False,lambda:True)
+    item=SharedExperts(layer,NS(moe_parallel_config=pc),False,lambda:True,lambda:True)
     x=torch.randn(m,16,dtype=torch.bfloat16); reference=layer(x);events.clear()
     aq=(x,torch.ones(m,1)) if prequant else None
     assert item.maybe_begin_dispatch(x,aq) is expected
@@ -90,7 +90,7 @@ def test_global_phase_and_split_state(setup,auto_ll,uniform,m,prequant,expected)
 def test_auto_delegate_modular_dispatch_and_combine_order(setup,ll):
     cfg,ctx,pc=setup;ctx.deepep_auto_use_low_latency=ll
     events=[];layer=Layer(events)
-    item=SharedExperts(layer,NS(moe_parallel_config=pc),False,lambda:True)
+    item=SharedExperts(layer,NS(moe_parallel_config=pc),False,lambda:True,lambda:True)
     x=torch.randn(16,16,dtype=torch.bfloat16);reference=layer(x);events.clear()
     class Delegate:
         def __init__(self,label,hook):self.label=label;self.hook=hook

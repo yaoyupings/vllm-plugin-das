@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Adapt Channel-FP8 loading and correctness fallbacks for GLM5Next."""
+"""Adapt Channel-quantized loading and correctness fallbacks for GLM5Next."""
 
 from __future__ import annotations
 
 import functools
+import os
 import sys
+from math import prod
 from types import ModuleType
 
 import torch
+from vllm.logger import init_logger
 
 from ._common import (
     PatchCompatibilityError,
@@ -35,6 +38,28 @@ _QUANT_IGNORE_PATCH_MARKER = "_vllm_hcu_glm5next_quant_ignore_applied"
 _QUANT_IGNORE_WRAPPER_MARKER = "_vllm_hcu_glm5next_quant_ignore_wrapper"
 _MHC_PATCH_MARKER = "_vllm_hcu_glm5next_boltops_mhc_applied"
 _MHC_WRAPPER_MARKER = "_vllm_hcu_glm5next_boltops_mhc_wrapper"
+_GATE_DEEPGEMM_PATCH_MARKER = "_vllm_hcu_glm5next_gate_deepgemm_applied"
+_GATE_DEEPGEMM_WRAPPER_MARKER = "_vllm_hcu_glm5next_gate_deepgemm_wrapper"
+_GATE_DEEPGEMM_ENV = "VLLM_HCU_GLM53_GATE_UP_DEEPGEMM"
+_LOGGER = init_logger(__name__)
+# Under the configured "vllm" logger so the layout reaches the server log.
+_LAYOUT_LOGGER = init_logger("vllm.hcu.glm5next_indexer_kcache")
+
+# Channel-INT8 checkpoints quantize a few MLA/indexer projections that the
+# official FP8 checkpoint keeps in BF16, so they are intentionally absent from
+# vLLM's ``_FP8_ATTN_PROJS`` table.  The HCU loader must still dequantize them
+# into the model's BF16 parameters.  Values use the same tuple contract as the
+# upstream mapping: (buffer key, target base, fused shard id, NoPE padding).
+_CHANNEL_INT8_ONLY_PROJS = {
+    ".kv_b_proj.": ("kv_b", "kv_b_proj", None, False),
+    ".indexer.wq_b.": ("indexer_wq_b", "indexer.wq_b", None, False),
+    ".indexer.wk.": (
+        "indexer_wk",
+        "indexer.wk_weights_proj",
+        0,
+        False,
+    ),
+}
 
 
 def _native_mhc_pre(
@@ -298,6 +323,129 @@ def _patch_glm5next_boltops_mhc(glm_model: ModuleType) -> bool:
     return True
 
 
+def _patch_glm5next_shared_gate_deepgemm(glm_model: ModuleType) -> bool:
+    """Opt in to DeepGEMM only for GLM5Next shared-expert gate_up."""
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.platforms.hcu import on_gfx938
+
+    if not henvs.optional_custom_op_enabled(
+        os.environ.get(_GATE_DEEPGEMM_ENV) == "1"
+    ) or not on_gfx938():
+        return False
+    from deepgemm import fp8_gemm
+
+    decoder_cls = vars(glm_model).get("Glm5NextDecoderLayer")
+    if not isinstance(decoder_cls, type):
+        raise PatchCompatibilityError(
+            f"required class {TARGET_MODULE}.Glm5NextDecoderLayer is missing"
+        )
+    original = require_callable(
+        decoder_cls,
+        "__init__",
+        f"{TARGET_MODULE}.Glm5NextDecoderLayer.__init__",
+    )
+    if getattr(decoder_cls, _GATE_DEEPGEMM_PATCH_MARKER, False):
+        if not getattr(original, _GATE_DEEPGEMM_WRAPPER_MARKER, False):
+            raise PatchCompatibilityError("GLM5Next gate DeepGEMM marker is stale")
+        return False
+
+    announced = False
+
+    @functools.wraps(original)
+    def hcu_decoder_init(
+        self,
+        vllm_config,
+        config,
+        layer_idx,
+        prefix="",
+        topk_indices_buffer=None,
+        is_mtp_layer=False,
+        **kwargs,
+    ):
+        original(
+            self,
+            vllm_config,
+            config,
+            layer_idx,
+            prefix,
+            topk_indices_buffer,
+            is_mtp_layer,
+            **kwargs,
+        )
+        if getattr(self, "is_mtp_layer", is_mtp_layer):
+            return
+        mlp = getattr(self, "mlp", None)
+        shared = getattr(mlp, "shared_experts", None)
+        gate = getattr(shared, "gate_up_proj", None)
+        scheme = getattr(gate, "scheme", None)
+        kernel = getattr(scheme, "fp8_linear", None)
+        if (
+            kernel is None
+            or getattr(type(kernel), "_hcu_fp8_backend", None) != "lightop"
+        ):
+            return
+        original_apply = require_callable(
+            kernel, "apply_scaled_mm", "GLM5Next shared gate_up FP8 kernel"
+        )
+
+        def deepgemm_apply(*, A, B, As, Bs, out_dtype, bias, output_shape):
+            if (
+                isinstance(A, torch.Tensor)
+                and isinstance(B, torch.Tensor)
+                and isinstance(As, torch.Tensor)
+                and isinstance(Bs, torch.Tensor)
+                and A.ndim == B.ndim == 2
+                and A.dtype == B.dtype == torch.float8_e4m3fn
+                and As.dtype == Bs.dtype == torch.float32
+                and A.device == B.device == As.device == Bs.device
+                and A.is_contiguous()
+                and B.shape[0] == A.shape[1]
+                and B.stride() == (1, A.shape[1])
+                and As.shape == (A.shape[0], 1)
+                and Bs.shape == (B.shape[1], 1)
+                and As.is_contiguous()
+                and Bs.is_contiguous()
+                and out_dtype in (torch.bfloat16, torch.float16)
+                and bias is None
+                and isinstance(output_shape, (list, tuple))
+                and len(output_shape) >= 2
+                # Match the original scaled-mm eager shape check. Avoid a
+                # symbolic equality during piecewise graph compilation.
+                and (
+                    torch.compiler.is_compiling()
+                    or (
+                        prod(output_shape[:-1]) == A.shape[0]
+                        and output_shape[-1] == B.shape[1]
+                    )
+                )
+            ):
+                nonlocal announced
+                output = torch.empty(
+                    (A.shape[0], B.shape[1]), device=A.device, dtype=out_dtype
+                )
+                fp8_gemm((A, As), (B, Bs), output)
+                if not announced:
+                    announced = True
+                    _LOGGER.info("GLM5Next shared gate_up uses DeepGEMM")
+                return output.view(*output_shape)
+            return original_apply(
+                A=A,
+                B=B,
+                As=As,
+                Bs=Bs,
+                out_dtype=out_dtype,
+                bias=bias,
+                output_shape=output_shape,
+            )
+
+        kernel.apply_scaled_mm = deepgemm_apply
+
+    setattr(hcu_decoder_init, _GATE_DEEPGEMM_WRAPPER_MARKER, True)
+    decoder_cls.__init__ = hcu_decoder_init
+    setattr(decoder_cls, _GATE_DEEPGEMM_PATCH_MARKER, True)
+    return True
+
+
 def _expand_glm5next_multimodal_ignore_aliases(ignore: list[str]) -> list[str]:
     """Add runtime aliases for checkpoint-rooted GLM5Next regex ignores."""
     expanded = list(ignore)
@@ -414,6 +562,71 @@ def _patch_glm5next_indexer_cache(attention: ModuleType) -> bool:
     return True
 
 
+# Official ROCm writers and prefill gather of the sparse-indexer K cache, with
+# the constexpr that selects 16x16 preshuffled pages and its token-major value.
+_NORMAL_LAYOUT_KPOOL_KERNELS = (
+    ("_kpool_softmax_rotate_write_cache_kernel", "PRESHUFFLE", False),
+    ("_kpool_decode_update_batched_kernel", "PRESHUFFLE", False),
+)
+_NORMAL_LAYOUT_SPARSE_KERNELS = (
+    ("_indexer_k_quant_and_cache_kernel", "LAYOUT", "NORMAL"),
+    ("_cp_gather_indexer_quant_cache_kernel", "LAYOUT", "NORMAL"),
+)
+
+
+class _PinnedConstexprKernel:
+    """Launch a Triton kernel with one constexpr argument pinned to a value."""
+
+    def __init__(self, kernel, name: str, value) -> None:
+        arg_names = list(getattr(kernel, "arg_names", ()))
+        if name not in arg_names:
+            raise PatchCompatibilityError(
+                f"Triton kernel {kernel!r} has no constexpr {name!r}"
+            )
+        self.kernel = kernel
+        self.name = name
+        self.value = value
+        self.index = arg_names.index(name)
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+
+        def run(*args, **kwargs):
+            if len(args) > self.index:
+                args = (*args[: self.index], self.value, *args[self.index + 1 :])
+            else:
+                kwargs[self.name] = self.value
+            return launch(*args, **kwargs)
+
+        return run
+
+    def __getattr__(self, attr):
+        return getattr(self.__dict__["kernel"], attr)
+
+
+def _install_normal_indexer_kcache_layout(
+    kpool: ModuleType, sparse: ModuleType
+) -> None:
+    """Write and gather token-major index-K pages for the LightOp decode reader."""
+    kpool_ops = vars(kpool).get("kpool_ops")
+    if not isinstance(kpool_ops, ModuleType):
+        raise PatchCompatibilityError(
+            f"required module {KPOOL_MODULE}.kpool_ops is missing"
+        )
+    for module, kernels in (
+        (kpool_ops, _NORMAL_LAYOUT_KPOOL_KERNELS),
+        (sparse, _NORMAL_LAYOUT_SPARSE_KERNELS),
+    ):
+        for attr, name, value in kernels:
+            kernel = vars(module).get(attr)
+            if kernel is None:
+                raise PatchCompatibilityError(
+                    f"required kernel {module.__name__}.{attr} is missing"
+                )
+            if not isinstance(kernel, _PinnedConstexprKernel):
+                setattr(module, attr, _PinnedConstexprKernel(kernel, name, value))
+
+
 def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
     from vllm_hcu.v1.attention.ops.lightop_kpool_topk_transform import (
         install_lightop_kpool_topk_transform,
@@ -455,7 +668,16 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
     # GLM5Next process; preserve the shared HCU fallback policy for all other
     # sparse models.
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as upstream_sparse
+    from vllm_hcu.platforms import envs as henvs
     from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as hcu_sparse
+
+    normal_layout = henvs.indexer_kcache_layout() == "normal"
+    if normal_layout and not hcu_sparse.on_gfx938():
+        _LAYOUT_LOGGER.warning(
+            "%s=normal only applies to gfx938; keeping the official layout",
+            henvs.INDEXER_KCACHE_LAYOUT_ENV,
+        )
+        normal_layout = False
 
     def glm5next_fp8_mqa_logits(*args, **kwargs):
         return hcu_sparse.rocm_fp8_mqa_logits(
@@ -465,10 +687,17 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
         )
 
     def glm5next_fp8_paged_mqa_logits(*args, **kwargs):
+        cache = args[1] if len(args) > 1 else kwargs["kv_cache_fp8"]
+        cache = hcu_sparse._paged_mqa_cache_kernel_view(cache)
+        physical_page_size = hcu_sparse._indexer_cache_as_hipc_view(cache).shape[1]
+        default_force_aiter = not hcu_sparse.on_gfx938() or physical_page_size == 1
+        force_aiter = kwargs.pop("force_aiter_triton", default_force_aiter)
+        if normal_layout:
+            kwargs.setdefault("kcache_layout", "normal")
         return hcu_sparse.rocm_fp8_paged_mqa_logits(
             *args,
             **kwargs,
-            force_aiter_triton=True,
+            force_aiter_triton=force_aiter,
         )
 
     if not hasattr(upstream_sparse, "_vllm_hcu_original_rocm_fp8_mqa_logits"):
@@ -480,6 +709,15 @@ def _patch_sparse_indexer_kpool(kpool: ModuleType) -> bool:
         )
     upstream_sparse.rocm_fp8_mqa_logits = glm5next_fp8_mqa_logits
     upstream_sparse.rocm_fp8_paged_mqa_logits = glm5next_fp8_paged_mqa_logits
+    if normal_layout:
+        _install_normal_indexer_kcache_layout(kpool, upstream_sparse)
+    _LAYOUT_LOGGER.info(
+        "GLM5Next sparse-indexer K-cache layout: %s (%s). All ranks and "
+        "prefill/decode peers must use the same layout; a mismatch silently "
+        "degrades accuracy.",
+        "normal" if normal_layout else "preshuffle",
+        henvs.INDEXER_KCACHE_LAYOUT_ENV,
+    )
 
     @functools.wraps(original)
     def hcu_forward_hip(
@@ -573,12 +811,13 @@ def _patch_indexer_nn_layout(attention: ModuleType) -> bool:
 
 
 def _projection(module: ModuleType, name: str):
-    for suffix, info in module._FP8_ATTN_PROJS.items():
-        if suffix in name:
-            layer_prefix = name.rsplit(suffix, 1)[0]
-            key, target_base, shard_id, is_kva = info
-            target = f"{layer_prefix}.{target_base}"
-            return layer_prefix, key, target, shard_id, is_kva
+    for projections in (module._FP8_ATTN_PROJS, _CHANNEL_INT8_ONLY_PROJS):
+        for suffix, info in projections.items():
+            if suffix in name:
+                layer_prefix = name.rsplit(suffix, 1)[0]
+                key, target_base, shard_id, is_kva = info
+                target = f"{layer_prefix}.{target_base}"
+                return layer_prefix, key, target, shard_id, is_kva
     return None
 
 
@@ -588,13 +827,13 @@ def _dequantize_channel_fp8(
 ) -> torch.Tensor:
     if weight.ndim != 2:
         raise ValueError(
-            f"Channel-FP8 weight must be 2-D, got {tuple(weight.shape)}"
+            f"Channel-quantized weight must be 2-D, got {tuple(weight.shape)}"
         )
     if scale.ndim == 1:
         scale = scale.unsqueeze(1)
     if scale.shape != (weight.shape[0], 1):
         raise ValueError(
-            "Channel-FP8 scale must have shape (out_features, 1), got "
+            "Channel-quantized scale must have shape (out_features, 1), got "
             f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
         )
     return (weight.float() * scale.float()).to(torch.bfloat16).contiguous()
@@ -604,6 +843,7 @@ def apply_to_module(module: ModuleType) -> bool:
     glm_model = load_exact_module(TARGET_MODULE, module)
     changed = _patch_multimodal_quant_ignore(glm_model)
     changed = _patch_glm5next_boltops_mhc(glm_model) or changed
+    changed = _patch_glm5next_shared_gate_deepgemm(glm_model) or changed
     kpool = sys.modules.get(KPOOL_MODULE)
     if isinstance(kpool, ModuleType):
         changed = _patch_sparse_indexer_kpool(kpool)
@@ -660,7 +900,15 @@ def apply_to_module(module: ModuleType) -> bool:
         target_weight = f"{target}.weight"
         target_scale = f"{target}.weight_scale"
         target_scale_inv = f"{target}.weight_scale_inv"
-        is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+        # GLM Channel checkpoints use the same per-output-channel scale
+        # contract for both FP8 and INT8 attention projections.  The official
+        # model keeps these projections in BF16, so both storage dtypes must be
+        # buffered with ``weight_scale`` and dequantized before the normal
+        # loader can cast the raw values into the BF16 parameter.
+        is_weight = name.endswith(".weight") and tensor.dtype in (
+            torch.float8_e4m3fn,
+            torch.int8,
+        )
         is_channel_scale = name.endswith(".weight_scale")
 
         # A target that remains quantized owns both tensors and must use the
