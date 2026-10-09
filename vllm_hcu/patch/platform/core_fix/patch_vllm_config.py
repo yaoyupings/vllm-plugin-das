@@ -26,6 +26,7 @@ TARGETS = (
     "vllm.config.model.ModelConfig.get_model_arch_config",
     "vllm_hcu.platforms.hcu.HCUPlatform.check_and_update_config",
     f"{TARGET_MODULE}.VllmConfig._maybe_enable_breakable_cudagraph",
+    "vllm.config.model.ModelConfig.verify_with_parallel_config",
 )
 _MARKER = "_vllm_hcu_feature_config_patch_applied"
 _GLM_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
@@ -429,6 +430,8 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
 
     validate_hy4_dcp_config(vllm_config)
+    from vllm_hcu.step5_dcp2_config import validate_step5_dcp2_config
+    validate_step5_dcp2_config(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
     feature_config = _normalize_dspark_draft_deepep_topology(
@@ -638,6 +641,11 @@ def apply_to_module(module: ModuleType) -> bool:
     )
     validate_v2_model_runner = vars(vllm_config).get("_validate_v2_model_runner")
     get_model_arch_config = vars(model_config_class).get("get_model_arch_config")
+    verify_parallel = vars(model_config_class).get("verify_with_parallel_config")
+    if not callable(verify_parallel) or tuple(inspect.signature(verify_parallel).parameters) != (
+        "self", "parallel_config",
+    ):
+        raise PatchCompatibilityError("ModelConfig.verify_with_parallel_config changed")
     if (
         not callable(maybe_enable_breakable)
         or not callable(with_hf_config)
@@ -711,6 +719,10 @@ def apply_to_module(module: ModuleType) -> bool:
         "get_model_arch_config",
         hcu_get_model_arch_config,
     )
+
+    from vllm_hcu.step5_dcp2_config import wrap_step5_parallel_verification
+    setattr(model_config_class, "verify_with_parallel_config",
+            wrap_step5_parallel_verification(verify_parallel))
 
     @functools.wraps(with_hf_config)
     def hcu_with_hf_config(self, hf_config: object, architectures=None):

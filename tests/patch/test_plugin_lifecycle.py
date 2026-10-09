@@ -83,7 +83,7 @@ def _fresh_python(
     env["VLLM_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
     env["VLLM_HCU_TARGET_ROOT"] = str(TARGET_PLUGIN_ROOT)
     env["PYTHONPATH"] = os.pathsep.join(
-        (str(TARGET_VLLM_ROOT), str(TARGET_PLUGIN_ROOT))
+        (str(TARGET_PLUGIN_ROOT), str(TARGET_VLLM_ROOT))
     )
     if no_site or not assert_target_install:
         # The dependency-light plugin probe intentionally runs without

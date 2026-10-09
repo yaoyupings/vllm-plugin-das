@@ -31,7 +31,7 @@ def validate_hy4_dcp_config(vllm_config: object) -> bool:
 
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
-    if model_config.architectures != [_HYV4_ARCHITECTURE]:
+    if model_config is None or model_config.architectures != [_HYV4_ARCHITECTURE]:
         return False
     if parallel_config.decode_context_parallel_size == 1:
         return False

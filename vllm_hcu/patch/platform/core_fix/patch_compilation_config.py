@@ -26,6 +26,7 @@ _HCU_CUDAGRAPH_UNSAFE_SPLITTING_OPS = (
     "vllm::hcu_sparse_attn_indexer",
 )
 _BOUND_CONFIGS_LOCK = threading.RLock()
+_BOUND_STEP5_AUTO_GRAPH: dict[int, weakref.ReferenceType[object]] = {}
 _BOUND_CONFIGS: dict[
     int,
     tuple[weakref.ReferenceType[object], HcuFeatureConfig],
@@ -62,12 +63,15 @@ def bind_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     if compilation_config is None:
         raise PatchCompatibilityError("VllmConfig.compilation_config is missing")
     key = id(compilation_config)
+    from vllm_hcu.step5_auto_graph import step5_auto_decode_graph_enabled
+    step5_graph = step5_auto_decode_graph_enabled(vllm_config)
 
     def remove_binding(reference: weakref.ReferenceType[object]) -> None:
         with _BOUND_CONFIGS_LOCK:
             current = _BOUND_CONFIGS.get(key)
             if current is not None and current[0] is reference:
                 _BOUND_CONFIGS.pop(key, None)
+                _BOUND_STEP5_AUTO_GRAPH.pop(key, None)
 
     try:
         reference = weakref.ref(compilation_config, remove_binding)
@@ -77,6 +81,10 @@ def bind_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         ) from exc
     with _BOUND_CONFIGS_LOCK:
         _BOUND_CONFIGS[key] = (reference, feature_config)
+        if step5_graph:
+            _BOUND_STEP5_AUTO_GRAPH[key] = reference
+        else:
+            _BOUND_STEP5_AUTO_GRAPH.pop(key, None)
     return feature_config
 
 
@@ -173,6 +181,17 @@ def apply_to_module(module: ModuleType) -> bool:
             data_parallel_size,
         )
         feature_config = _bound_hcu_config(self) or HcuFeatureConfig()
+        with _BOUND_CONFIGS_LOCK:
+            step5_reference = _BOUND_STEP5_AUTO_GRAPH.get(id(self))
+            step5_decode_graph = (
+                step5_reference is not None and step5_reference() is self
+            )
+        if (feature_config.deepep_auto and data_parallel_size == 2
+                and step5_decode_graph
+                and getattr(self.cudagraph_mode, "name", "") == "FULL_DECODE_ONLY"):
+            # DP voting admits FULL replay only for pure Decode. The worker
+            # verifies every capture descriptor and scopes LL to capture.
+            return result
         if feature_config.deepep_auto and data_parallel_size > 1:
             # deepep_auto includes the same HT dispatch that upstream marks
             # CUDA-Graph incompatible for DP. Keep the standard CLI contract

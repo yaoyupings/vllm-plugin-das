@@ -98,6 +98,19 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(map_backend)
     def hcu_map_unquantized_backend(runner_backend):
+        # Some vLLM consumers retain the original selector during import, but
+        # resolve this mapping dynamically. Cover that path for mixed Step5.
+        if runner_backend == "deep_gemm":
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+            cfg = get_current_vllm_config_or_none()
+            if any(a in ("Step5ForCausalLM", "Step5ForConditionalGeneration")
+                   for a in model_architectures(cfg)):
+                backend = cfg.parallel_config.all2all_backend
+                runner_backend = (
+                    "batched_triton" if backend == "deepep_low_latency" else "triton"
+                )
         mapped = map_backend(runner_backend)
         return _normalize_backend(mapped, old_enum, hcu_enum)
 
@@ -110,6 +123,18 @@ def apply_to_module(module: ModuleType) -> bool:
             lightop_w16a16_moe,
         )
         from vllm_hcu.platforms import envs as henvs
+
+        # Step5 intentionally leaves its last three routed layers in BF16.
+        # An FP8-only DeepGEMM selection must not force these layers to quantize.
+        if getattr(moe_config, "moe_backend", "auto") == "deep_gemm":
+            from dataclasses import replace
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm_hcu.deepseek_v4_runtime import model_architectures
+
+            architectures = model_architectures(get_current_vllm_config_or_none())
+            if any(a in ("Step5ForCausalLM", "Step5ForConditionalGeneration")
+                   for a in architectures):
+                moe_config = replace(moe_config, moe_backend="auto")
 
         if (
             getattr(moe_config, "moe_backend", "auto") == "auto"
@@ -144,6 +169,18 @@ def apply_to_module(module: ModuleType) -> bool:
                 if configs_available:
                     return hcu_enum.HCU_LIGHTOP_W16A16, experts_cls
 
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.model_executor.layers.fused_moe.step5_deepep_auto import (
+            step5_auto_experts_enabled,
+        )
+        if step5_auto_experts_enabled(
+            moe_config, get_current_vllm_config_or_none()
+        ):
+            from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
+                BatchedTritonExperts,
+            )
+            # Both Triton children consume canonical BF16 weights.
+            return hcu_enum.BATCHED_TRITON, BatchedTritonExperts
         backend, experts = select_backend(moe_config)
         return _normalize_backend(backend, old_enum, hcu_enum), experts
 
@@ -180,6 +217,45 @@ def apply_to_module(module: ModuleType) -> bool:
         experts_cls,
         routing_tables=None,
     ):
+        # Bound BF16 scratch space only for the opted-in Step5 DP8/TP1 HT path.
+        import os
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.deepseek_v4_runtime import model_architectures
+        from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+
+        cfg = get_current_vllm_config_or_none()
+        from vllm_hcu.model_executor.layers.fused_moe.step5_sp_workspace import (
+            bound_sequence_parallel_workspace,
+        )
+        moe_config = bound_sequence_parallel_workspace(moe_config, cfg)
+        from vllm_hcu.model_executor.layers.fused_moe.step5_deepep_auto import (
+            Step5AutoBF16Experts, step5_auto_experts_enabled,
+        )
+        if step5_auto_experts_enabled(moe_config, cfg):
+            from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+                _make_deepep_auto_deepgemm_moe_kernel,
+            )
+            return _make_deepep_auto_deepgemm_moe_kernel(
+                moe_quant_config=quant_config,
+                moe_config=moe_config,
+                routing_tables=routing_tables,
+                experts_cls=Step5AutoBF16Experts,
+            )
+        if (
+            os.getenv("VLLM_STEP5_HT_COMPACT_WORKSPACE", "0") == "1"
+            and experts_cls is TritonExperts
+            and cfg is not None
+            and any(a in ("Step5ForCausalLM", "Step5ForConditionalGeneration")
+                    for a in model_architectures(cfg))
+            and cfg.parallel_config.tensor_parallel_size == 1
+            and cfg.parallel_config.data_parallel_size == 8
+            and cfg.parallel_config.all2all_backend == "deepep_high_throughput"
+        ):
+            from vllm_hcu.model_executor.layers.fused_moe.step5_ht_workspace import (
+                Step5HTChunkedTritonExperts,
+            )
+
+            experts_cls = Step5HTChunkedTritonExperts
         return make_kernel(
             quant_config,
             moe_config,
@@ -204,6 +280,17 @@ def apply_to_module(module: ModuleType) -> bool:
         hcu_convert_to_unquantized_kernel_format
     )
     target.make_unquantized_moe_kernel = hcu_make_unquantized_moe_kernel
+    import sys
+
+    consumer = sys.modules.get(
+        "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+    )
+    if consumer is not None:
+        for name in ("UnquantizedMoeBackend", "select_unquantized_moe_backend",
+                     "convert_to_unquantized_kernel_format",
+                     "make_unquantized_moe_kernel"):
+            if hasattr(consumer, name):
+                setattr(consumer, name, getattr(target, name))
     setattr(target, _MARKER, True)
     return True
 

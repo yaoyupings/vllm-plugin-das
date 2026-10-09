@@ -171,7 +171,14 @@ def apply_to_module(module: ModuleType) -> bool:
         is_channel_fp8 = (weight_key, activation_key) == channel_fp8_scheme
         if sidecar.deepep_auto:
             architectures = _model_architectures(config)
-            if "DeepseekV4ForCausalLM" not in architectures:
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep_auto import (
+                step5_auto_experts_enabled,
+            )
+            step5_auto = step5_auto_experts_enabled(
+                config, get_current_vllm_config_or_none()
+            )
+            if "DeepseekV4ForCausalLM" not in architectures and not step5_auto:
                 raise ValueError(
                     "HCU Channel-FP8 deepep_auto is validated only for "
                     "DeepSeek-V4; use an explicit DeepEP high-throughput or "
@@ -286,6 +293,14 @@ def apply_to_module(module: ModuleType) -> bool:
         routing_tables=None,
     ):
         if fp8_backend == hcu_enum.HCU_DEEPGEMM:
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm_hcu.model_executor.layers.fused_moe.step5_sp_workspace import (
+                bound_sequence_parallel_workspace,
+            )
+            moe_config = bound_sequence_parallel_workspace(
+                moe_config, get_current_vllm_config_or_none()
+            )
+        if fp8_backend == hcu_enum.HCU_DEEPGEMM:
             # Scope the post-dispatch quantization ABI to the selected HCU
             # Channel-FP8 backend. Channel-INT8 and official FP8 kernels keep
             # their existing DeepEP dispatch behavior.
@@ -336,6 +351,26 @@ def apply_to_module(module: ModuleType) -> bool:
     target.convert_to_fp8_moe_kernel_format = hcu_convert_to_fp8_moe_kernel_format
     target._vllm_hcu_original_make_fp8_moe_kernel = make_kernel
     target.make_fp8_moe_kernel = hcu_make_fp8_moe_kernel
+    # Quantization modules can import the oracle before worker adapters run.
+    # Rebind their known copied symbols so they use the selected HCU ABI too.
+    import sys
+
+    consumers = (
+        "vllm.model_executor.layers.quantization.fp8",
+        "vllm.model_executor.layers.quantization.online.fp8",
+        "vllm.model_executor.layers.quantization.modelopt",
+        "vllm.model_executor.layers.quantization.quark.quark_moe",
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8",
+    )
+    for consumer_name in consumers:
+        consumer = sys.modules.get(consumer_name)
+        if consumer is None:
+            continue
+        for name in ("Fp8MoeBackend", "select_fp8_moe_backend",
+                     "convert_to_fp8_moe_kernel_format", "make_fp8_moe_kernel"):
+            if hasattr(consumer, name):
+                setattr(consumer, name, getattr(target, name))
     setattr(target, _MARKER, True)
     return True
 

@@ -636,8 +636,12 @@ class HCUPlatform(Platform):
         # if cache_config and cache_config.block_size is None:
         #     cache_config.block_size = 64
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
-            # decode context parallel does not support full cudagraphs
-            if parallel_config.decode_context_parallel_size > 1:
+            # Most DCP backends retain the stock PIECEWISE restriction.
+            # Step5's opt-in gathered-head adapter has native changing-input
+            # Graph qualification through the actual ForwardContext boundary.
+            from vllm_hcu.step5_dcp2_config import step5_dcp2_full_graph_allowed
+            if (parallel_config.decode_context_parallel_size > 1
+                and not step5_dcp2_full_graph_allowed(vllm_config)):
                 logger.warning_once(
                     "Decode context parallel (DCP) is enabled, which is "
                     "incompatible with full CUDA graphs. "

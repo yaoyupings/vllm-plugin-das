@@ -300,6 +300,10 @@ _MOE_RUNTIME_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_moe_align_block_size")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_rocm_aiter_moe")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_triton_moe")),
+    _CallbackSpec(
+        _adapter("op_opt.moe", "patch_fused_batched_moe"),
+        feature="deepep_low_latency",
+    ),
     _CallbackSpec(_adapter("op_opt.moe", "patch_base_router")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_fused_topk_bias_router")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_router_factory")),

@@ -10,12 +10,15 @@ activation scales.
 """
 
 import functools
+import os
 
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 
 from vllm.logger import init_logger
+from vllm.config import get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -28,6 +31,13 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     deepgemm_unpermute_and_reduce,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm_hcu.model_executor.layers.fused_moe.step5_ht_workspace import (
+    compact_aligned_rows,
+    compact_moe_permute,
+    compact_workspace_parallelism_supported,
+    prepare_compact_metadata,
+    Step5HTTokensMetadata,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
     TopKWeightAndReduceNoOP,
@@ -161,12 +171,39 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             (kInt8StaticChannelSym, kInt8DynamicTokenSym),
         )
 
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUSTEP)
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
+        if moe_config.activation == MoEActivation.SWIGLUSTEP:
+            self.quant_config.gemm1_clamp_limit = 7.0
+        config = get_current_vllm_config()
+        self._compact_step5_ht = (
+            os.getenv("VLLM_STEP5_HT_COMPACT_WORKSPACE", "0") == "1"
+            and self.WEIGHT_LAYOUT == "contiguous"
+            and "Step5ForConditionalGeneration"
+            in (config.model_config.hf_config.architectures or [])
+            and compact_workspace_parallelism_supported(
+                config.parallel_config.tensor_parallel_size,
+                config.parallel_config.data_parallel_size,
+            )
+            and not quant_config.use_int8_w8a8
+        )
+        if self._compact_step5_ht:
+            logger.info_once("Step5 HT compact workspace uses fresh post-dispatch counts.")
+        self._step5_ht_dispatch_map_cache = (
+            {}
+            if self._compact_step5_ht
+            and os.getenv("VLLM_STEP5_HT_REUSE_DISPATCH_COUNTS", "0") == "1"
+            and getattr(config.parallel_config, "enable_eplb", True) is False
+            else None
+        )
         self._deepgemm_w13: torch.Tensor | None = None
         self._deepgemm_w2: torch.Tensor | None = None
         logger.info_once(
@@ -299,6 +336,16 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    def prepare_workspace_metadata(
+        self, topk_ids, local_num_experts, expert_map, expert_tokens_meta
+    ):
+        if not getattr(self, "_compact_step5_ht", False):
+            return expert_tokens_meta
+        return prepare_compact_metadata(
+            topk_ids, local_num_experts, expert_map, expert_tokens_meta,
+            self._step5_ht_dispatch_map_cache,
+        )
+
     def workspace_shapes(
         self,
         M: int,
@@ -310,13 +357,17 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        m_aligned = compute_aligned_M(
-            M=M,
-            num_topk=topk,
-            local_num_experts=local_num_experts,
-            alignment=self.ALIGNMENT,
-            expert_tokens_meta=expert_tokens_meta,
+        m_aligned = compact_aligned_rows(
+            expert_tokens_meta, M, topk, local_num_experts
         )
+        if m_aligned is None:
+            m_aligned = compute_aligned_M(
+                M=M,
+                num_topk=topk,
+                local_num_experts=local_num_experts,
+                alignment=self.ALIGNMENT,
+                expert_tokens_meta=expert_tokens_meta,
+            )
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         workspace13 = (m_aligned, max(activation_out_dim, K))
         workspace2 = (m_aligned, max(N, K))
@@ -342,7 +393,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         apply_router_weight_on_input: bool,
     ):
         del apply_router_weight_on_input
-        if activation != MoEActivation.SILU:
+        if activation not in (MoEActivation.SILU, MoEActivation.SWIGLUSTEP):
             raise NotImplementedError(
                 "DeepEP DeepGEMM HT path currently mirrors SGLang's silu-only "
                 f"implementation, got {activation.value}."
@@ -368,19 +419,28 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         _, _, N, K, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
 
         a1q_scale = self._ensure_2d_scale(a1q_scale)
-        m_aligned = compute_aligned_M(
-            M=topk_ids.size(0),
-            num_topk=topk_ids.size(1),
-            local_num_experts=local_num_experts,
-            alignment=self.ALIGNMENT,
-            expert_tokens_meta=expert_tokens_meta,
+        m_aligned = compact_aligned_rows(
+            expert_tokens_meta, topk_ids.size(0), topk_ids.size(1), local_num_experts
         )
+        if m_aligned is None:
+            m_aligned = compute_aligned_M(
+                M=topk_ids.size(0),
+                num_topk=topk_ids.size(1),
+                local_num_experts=local_num_experts,
+                alignment=self.ALIGNMENT,
+                expert_tokens_meta=expert_tokens_meta,
+            )
 
         a1q_perm = _resize_cache(
             workspace13.view(dtype=hidden_states.dtype), (m_aligned, K)
         )
+        permute = (
+            compact_moe_permute
+            if isinstance(expert_tokens_meta, Step5HTTokensMetadata)
+            else deepgemm_moe_permute
+        )
         input_tensor, input_scale, m_indices, inv_perm, _align_used = (
-            deepgemm_moe_permute(
+            permute(
                 aq=hidden_states,
                 aq_scale=a1q_scale,
                 topk_ids=topk_ids,
@@ -518,11 +578,74 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+        if moe_config.activation == MoEActivation.SWIGLUSTEP:
+            self.quant_config.gemm1_clamp_limit = 7.0
         self._deepgemm_w13: torch.Tensor | None = None
         self._deepgemm_w2: torch.Tensor | None = None
         logger.info_once(
             "Using DeepEPDeepGemmMaskedExperts with DeepGEMM LL path.",
         )
+
+        self._step5_ll_tuning = False
+        if (
+            moe_config.activation == MoEActivation.SWIGLUSTEP
+            and not quant_config.use_int8_w8a8
+            # Enable measured Step5 shape tuning by default; set the flag to 0
+            # to select the original native mode lookup for every token count.
+            and os.environ.get("VLLM_STEP5_LL_GEMM_TUNING", "1") == "1"
+        ):
+            config = get_current_vllm_config()
+            arch = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).gcnArchName.split(":")[0]
+            parallel = config.parallel_config
+            from vllm_hcu.step5_dcp2_config import step5_context_parallel_supported
+            supported_parallel = (
+                parallel.tensor_parallel_size == 1
+                and parallel.data_parallel_size == 8
+            ) or (
+                (parallel.tensor_parallel_size, parallel.data_parallel_size)
+                in ((2, 4), (4, 2))
+                and parallel.pipeline_parallel_size == 1
+                and step5_context_parallel_supported(config)
+                and moe_config.is_sequence_parallel
+                and moe_config.ep_size == 8
+                and os.environ.get("VLLM_STEP5_SEQUENCE_PARALLEL_MOE", "0") == "1"
+            )
+            self._step5_ll_tuning = (
+                config.model_config.hf_text_config.model_type == "step5"
+                and supported_parallel
+                and arch == "gfx938"
+            )
+            if self._step5_ll_tuning:
+                logger.info_once(
+                    "Using measured Step5 gfx938 masked DeepGEMM modes: "
+                    "1101 for <=512 global tokens, otherwise native mode lookup."
+                )
+
+    def _step5_masked_gemm_config(self, experts, n, k, use_int8):
+        if (
+            not self._step5_ll_tuning
+            or use_int8
+            or (experts, n, k) != (44, 3072, 4096)
+        ):
+            return None
+        context = get_forward_context()
+        key = "_step5_ll_masked_gemm_config"
+        if hasattr(context, key):
+            return getattr(context, key)
+        metadata = context.dp_metadata
+        if metadata is None:
+            return None
+        tokens = metadata.num_tokens_across_dp_cpu
+        if tokens.device.type != "cpu":
+            return None
+        # Host scheduler counts are already available. Read once per forward,
+        # not once per expert layer; never synchronize device routing counts.
+        total = sum(tokens.tolist())
+        config = {"MODE": 1101} if 0 < total <= 512 else None
+        setattr(context, key, config)
+        return config
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -544,7 +667,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SILU
+        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUSTEP)
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -592,6 +715,21 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         workspace13 = (local_num_experts, max_tokens, max(K, activation_out_dim))
         workspace2 = (local_num_experts, max_tokens, max(N, K))
+        if (
+            getattr(self, "_step5_ll_tuning", False)
+            and os.getenv("VLLM_STEP5_LL_COMPACT_WORKSPACE", "0") == "1"
+            and not self.quant_config.use_int8_w8a8
+            and (local_num_experts, N, K) == (44, 3072, 4096)
+        ):
+            # apply() uses this buffer only for gate/up output [E, M, N].
+            # The down result aliases workspace13 through the native allocator,
+            # so that shared output arena must retain its K-sized bound.
+            workspace2 = (local_num_experts, max_tokens, N)
+            logger.info_once(
+                "Step5 masked FP8 compact workspace: gate/up width=%s "
+                "instead of%s; capacity=%s; experts=%s",
+                N, max(N, K), max_tokens, local_num_experts,
+            )
         output = (local_num_experts, max_tokens, K)
         return workspace13, workspace2, output
 
@@ -616,9 +754,9 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         del topk_weights, global_num_experts, expert_map
         del a2_scale, apply_router_weight_on_input
         del workspace13
-        if activation != MoEActivation.SILU:
+        if activation not in (MoEActivation.SILU, MoEActivation.SWIGLUSTEP):
             raise NotImplementedError(
-                "DeepEP DeepGEMM LL path currently supports silu only, "
+                "DeepEP DeepGEMM LL path currently supports silu and swiglustep, "
                 f"got {activation.value}."
             )
         if expert_tokens_meta is None:
@@ -652,12 +790,17 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             if use_int8
             else m_grouped_fp8_gemm_nt_masked
         )
+        gemm_config = self._step5_masked_gemm_config(
+            local_num_experts, N, K, use_int8
+        )
+        gemm_kwargs = {} if gemm_config is None else {"config": gemm_config}
         grouped_gemm(
             (hidden_states, a1q_scale),
             (self._deepgemm_w13, self._ensure_ll_weight_scale(self.w1_scale)),
             gateup_output,
             expert_num_tokens,
             max_tokens,
+            **gemm_kwargs,
         )
 
         if use_int8:
@@ -695,6 +838,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             out_view,
             expert_num_tokens,
             max_tokens,
+            **gemm_kwargs,
         )
 
     @staticmethod
@@ -1144,7 +1288,15 @@ def _make_deepep_auto_deepgemm_moe_kernel(
         get_current_vllm_config_or_none()
     )
     if experts_cls is None:
-        experts_cls = DeepEPAutoDeepGemmExperts
+        from vllm_hcu.model_executor.layers.fused_moe.step5_deepep_auto import (
+            Step5AutoFP8Experts, step5_auto_experts_enabled,
+        )
+        if (not moe_quant_config.use_int8_w8a8
+                and step5_auto_experts_enabled(
+                    moe_config, get_current_vllm_config_or_none())):
+            experts_cls = Step5AutoFP8Experts
+        else:
+            experts_cls = DeepEPAutoDeepGemmExperts
     experts = experts_cls(
         moe_config=moe_config,
         quant_config=moe_quant_config,

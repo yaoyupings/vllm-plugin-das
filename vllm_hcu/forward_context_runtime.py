@@ -76,6 +76,10 @@ def choose_deepep_auto_low_latency(
         dspark_mooncake_pd_use_low_latency,
     )
 
+    from vllm_hcu.step5_auto_graph import step5_auto_capture_uses_ll
+    capture_ll = step5_auto_capture_uses_ll(vllm_config, num_tokens)
+    if capture_ll is not None:
+        return capture_ll
     fixed_use_low_latency = dspark_mooncake_pd_use_low_latency(vllm_config)
     if fixed_use_low_latency is not None:
         return fixed_use_low_latency

@@ -107,7 +107,21 @@ class HcuGPUWorker(Worker):
 
         validate_worker_patches(require_applied=True)
 
+    def determine_available_memory(self) -> int:
+        from vllm_hcu.v1.step5_memory_lifecycle import trace_memory
+        trace_memory(self, "before_profile")
+        from vllm_hcu.v1.step5_graph_memory import exact_graph_memory
+        with exact_graph_memory(self.vllm_config):
+            available = super().determine_available_memory()
+        trace_memory(self, "after_profile")
+        from vllm_hcu.v1.step5_dsa_memory import reserve_step5_dsa_memory
+        available = reserve_step5_dsa_memory(self, available)
+        trace_memory(self, "after_budget")
+        return available
+
     def compile_or_warm_up_model(self):
+        from vllm_hcu.v1.step5_memory_lifecycle import trace_memory
+        trace_memory(self, "after_kv_before_warmup")
         if (
             self.use_v2_model_runner
             and self.parallel_config.pipeline_parallel_size > 1
@@ -119,7 +133,9 @@ class HcuGPUWorker(Worker):
 
             with suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
                 return super().compile_or_warm_up_model()
-        return super().compile_or_warm_up_model()
+        result = super().compile_or_warm_up_model()
+        trace_memory(self, "after_warmup")
+        return result
 
     def init_device(self):
         if self.device_config.device_type == "cuda":

@@ -51,6 +51,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def __init__(self, vllm_config, device):
         self._hcu_pcp_manager_cls = None
         super().__init__(vllm_config, device)
+        from vllm_hcu.step5_auto_graph import (
+            install_step5_auto_capture, step5_auto_decode_graph_enabled,
+        )
+        if step5_auto_decode_graph_enabled(vllm_config):
+            install_step5_auto_capture()
         # Upstream creates the selected manager during KV-cache
         # initialization. Keep the adapter attribute available before that
         # lifecycle point without allocating a second manager.
@@ -107,6 +112,9 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
 
     def profile_run(self) -> None:
         """Profile PCP with the per-rank token budget plus routing slack."""
+
+        from vllm_hcu.step5_auto_graph import reserve_step5_auto_workspace
+        reserve_step5_auto_workspace(self.vllm_config, self.device)
 
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size

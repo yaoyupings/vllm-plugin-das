@@ -313,6 +313,16 @@ def ht_receiver(
     post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
         quant_config
     )
+    import os
+    if (post_dispatch_channel_fp8
+            and os.environ.get("VLLM_STEP5_HT_REUSE_DISPATCH_COUNTS", "0") == "1"):
+        from vllm_hcu.model_executor.layers.fused_moe.step5_ht_workspace import (
+            mark_fresh_dispatch_metadata,
+        )
+        expert_tokens_meta = mark_fresh_dispatch_metadata(
+            expert_tokens_meta, expert_topk_ids, self.rank_expert_offset,
+            num_experts,
+        )
     if (
         not defer_input_quant
         and not quant_config.is_block_quantized

@@ -5772,3 +5772,53 @@ def test_importing_adapters_does_not_eager_import_optional_moe_stacks():
         importlib.reload(adapter)
     for name in optional:
         assert sys.modules.get(name) is before[name]
+
+def test_step5_auto_sp_ll_construction_uses_one_bound_for_handle_and_experts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm_hcu.step5_auto_graph as graph
+    calls = {}
+    monkeypatch.setenv("VLLM_STEP5_AUTO_SP_LL_WORKSPACE", "1")
+    monkeypatch.setattr(graph, "step5_auto_decode_graph_enabled",
+                        lambda config, **kwargs: True)
+    class Manager:
+        is_deepep_auto_manager = True
+        dp_world_size = 2
+        world_size = 8
+        rank = 0
+        def get_handle(self, kwargs):
+            calls["handle"] = kwargs
+            return "one-handle"
+    class HT:
+        def __init__(self, handle, **kwargs):
+            self.handle=handle;self.kwargs=kwargs
+    class LL(HT):
+        def max_num_tokens_per_rank(self):
+            return self.kwargs["max_tokens_per_rank"]
+    def original(moe,quant_config,routing_tables=None,allow_new_interface=False,
+                 use_monolithic=False,eep_stage=False):
+        raise AssertionError("Auto must use its adapter")
+    def roundup(hidden_size,act_dtype,moe_parallel_config):
+        return hidden_size
+    cfg=SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=64,max_num_batched_tokens=16384),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3))
+    module=_module(
+        patch_all2all_utils.TARGET_MODULE,torch=torch,
+        current_platform=SimpleNamespace(fp8_dtype=lambda:torch.float8_e4m3fn),
+        get_ep_all2all_manager=lambda stage:Manager(),
+        get_current_vllm_config=lambda:cfg,
+        DeepEPHTPrepareAndFinalize=HT,DeepEPLLPrepareAndFinalize=LL,
+        maybe_make_prepare_finalize=original,maybe_roundup_layer_hidden_size=roundup)
+    patch_all2all_utils.apply_to_module(module)
+    moe=SimpleNamespace(
+        max_num_tokens=16384,dp_size=2,num_experts=352,num_local_experts=44,hidden_dim=4096,
+        moe_parallel_config=SimpleNamespace(
+            use_deepep_auto_kernels=True,is_sequence_parallel=True,sp_size=4,ep_size=8))
+    result=module.maybe_make_prepare_finalize(
+        moe,SimpleNamespace(quant_dtype=torch.float8_e4m3fn))
+    assert calls["handle"]["max_num_tokens_per_dp_rank"]==64
+    assert result.ll_prepare_finalize.max_num_tokens_per_rank()==64
+    assert result.ht_prepare_finalize.handle==result.ll_prepare_finalize.handle=="one-handle"
+    assert cfg.scheduler_config.max_num_batched_tokens==moe.max_num_tokens==16384
+    assert result.ht_prepare_finalize.kwargs["num_dispatchers"]==8

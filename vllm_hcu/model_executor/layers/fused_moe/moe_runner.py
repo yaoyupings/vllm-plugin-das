@@ -296,6 +296,9 @@ class MoERunner(MoERunnerInterface):
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
         self.enable_dbo = enable_dbo
+        from .step5_ll_chunk import configured_chunk_tokens
+        self._step5_ll_chunk_tokens = configured_chunk_tokens(
+            moe_config, get_current_vllm_config())
 
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
@@ -713,6 +716,32 @@ class MoERunner(MoERunnerInterface):
             fused_out,
         )
 
+    def _apply_step5_ll_input_chunks(self, **kwargs):
+        chunk = self._step5_ll_chunk_tokens
+        if not chunk:
+            return self._apply_quant_method(**kwargs)
+        if (self.enable_dbo or self.do_naive_dispatch_combine
+            or kwargs["hidden_states"].dtype != torch.bfloat16
+            or self._quant_method.is_monolithic
+            or any(kwargs[k] is not None for k in (
+                "input_ids", "quanted_hidden_states", "scale", "topk_weights", "topk_ids"))):
+            raise RuntimeError("Unsupported Step5 LL input chunk runner path")
+        from .step5_ll_chunk import uniform_chunk_count, apply_input_chunks
+        context = get_forward_context()
+        counts = (context.dp_metadata.num_tokens_across_dp_cpu
+                  if context.dp_metadata is not None else None)
+        count = uniform_chunk_count(kwargs["hidden_states"].shape[0], counts,
+                                    self.moe_config.sp_size, chunk)
+        if count == 1:
+            return self._apply_quant_method(**kwargs)
+        logger.info_once("Step5 LL input chunks: dispatcher capacity=%s, calls=%s",
+                         chunk, count, scope="process")
+        return apply_input_chunks(self._apply_quant_method,
+                                 hidden_states=kwargs["hidden_states"],
+                                 router_logits=kwargs["router_logits"],
+                                 shared_experts_input=kwargs["shared_experts_input"],
+                                 chunk=chunk, num_chunks=count)
+
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
         redistribution.
@@ -1006,7 +1035,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
             )
 
-            shared_output, hidden_states = self._apply_quant_method(
+            shared_output, hidden_states = self._apply_step5_ll_input_chunks(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,

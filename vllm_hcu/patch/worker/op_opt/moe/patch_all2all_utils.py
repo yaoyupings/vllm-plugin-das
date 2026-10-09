@@ -94,6 +94,12 @@ def apply_to_module(module: ModuleType) -> bool:
                 speculative_config, "num_speculative_tokens", 0
             )
             max_tokens *= 1 + int(num_speculative_tokens or 0)
+            from vllm_hcu.model_executor.layers.fused_moe.step5_sp_workspace import (
+                step5_auto_ll_dispatch_bound,
+            )
+            sp_ll_bound = step5_auto_ll_dispatch_bound(moe, vllm_config)
+            if sp_ll_bound is not None:
+                max_tokens = sp_ll_bound
             handle = all2all_manager.get_handle(
                 {
                     "max_num_tokens_per_dp_rank": max_tokens,

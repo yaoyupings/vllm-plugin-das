@@ -276,8 +276,16 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
 ):
     from vllm_hcu.platforms import envs as hcu_envs
 
+    applied = []
+
+    class Buffer:
+        @staticmethod
+        def set_num_sms(num_sms):
+            applied.append(num_sms)
+
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(Buffer=Buffer))
     module = _fake_all2all_module()
-    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 17)
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 24)
     assert patch_all2all.apply_to_module(module) is True
     assert patch_all2all.apply_to_module(module) is False
 
@@ -287,11 +295,13 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
     assert kwargs["num_nvl_bytes"] == 256 * 1024 * 1024
     assert kwargs["num_rdma_bytes"] == 500_000_000
     assert kwargs["num_qps_per_rank"] == 30
+    assert applied == [24]
     manager.set_num_sms(29)
-    assert manager.applied_sms == 17
-    # The legacy contract replaces the call argument with the environment
-    # override first, then preserves vLLM's upper bound by ``self.num_sms``.
-    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 40)
+    assert manager.applied_sms == 24
+
+    # DBO retains the existing manager cap. Buffer initialization separately
+    # validates the requested budget before constructing the HT buffer.
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 36)
     manager.set_num_sms(29)
     assert manager.applied_sms == 30
     intranode = module.DeepEPHTAll2AllManager("group")
@@ -300,6 +310,7 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
     assert intranode_kwargs["num_rdma_bytes"] == 0
     assert intranode_kwargs["num_qps_per_rank"] == 1
     assert intranode_kwargs["num_nvl_bytes"] == 256 * 1024 * 1024
+    assert applied == [24, 36]
 
 
 def test_deep_ep_ht_nvl_buffer_tracks_configured_size(
@@ -310,7 +321,7 @@ def test_deep_ep_ht_nvl_buffer_tracks_configured_size(
     from vllm_hcu.platforms import envs as hcu_envs
 
     module = _fake_all2all_module()
-    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 17)
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", None)
     assert patch_all2all.apply_to_module(module) is True
 
     module.envs.VLLM_DEEPEP_BUFFER_SIZE_MB = 64
@@ -320,6 +331,50 @@ def test_deep_ep_ht_nvl_buffer_tracks_configured_size(
     module.envs.VLLM_DEEPEP_BUFFER_SIZE_MB = 2048
     large = module.DeepEPHTAll2AllManager("group", "tcp")
     assert large._make_all2all_kwargs()["num_nvl_bytes"] == 2048 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "requested,internode",
+    [(0, False), (-6, False), (7, False), (64, False), (66, False), (36, True)],
+)
+def test_deep_ep_ht_rejects_invalid_budget_before_buffer_initialization(
+    monkeypatch: pytest.MonkeyPatch, requested: int, internode: bool
+):
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "deep_ep",
+        SimpleNamespace(Buffer=SimpleNamespace(set_num_sms=calls.append)),
+    )
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", requested)
+    module = _fake_all2all_module()
+    assert patch_all2all.apply_to_module(module)
+    manager = module.DeepEPHTAll2AllManager("group", "tcp" if internode else None)
+    with pytest.raises(ValueError, match="positive multiple of 6"):
+        manager._make_all2all_kwargs()
+    assert calls == []
+
+
+def test_deep_ep_ht_default_does_not_change_buffer_launch_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "deep_ep",
+        SimpleNamespace(Buffer=SimpleNamespace(set_num_sms=calls.append)),
+    )
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", None)
+    module = _fake_all2all_module()
+    assert patch_all2all.apply_to_module(module)
+    manager = module.DeepEPHTAll2AllManager("group")
+    kwargs = manager._make_all2all_kwargs()
+    assert manager.num_sms == 60 and kwargs["num_rdma_bytes"] == 0
+    assert calls == []
 
 
 def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(

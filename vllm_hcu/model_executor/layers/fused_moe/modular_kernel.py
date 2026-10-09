@@ -1164,6 +1164,8 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         prequanted_a1_scale: torch.Tensor | None = None,
         prequanted_a1: bool = False,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -1249,6 +1251,13 @@ class FusedMoEKernelModularImpl:
                 prepare_ret if isinstance(prepare_ret, tuple) else (None, prepare_ret)
             )
 
+            if (
+                hook is not None and not dbo_enabled()
+                and not prequanted_a1 and shared_experts is not None
+                and shared_experts_input is not None
+            ):
+                shared_experts.maybe_begin_dispatch(shared_experts_input)
+
             if hook is not None:
                 if dbo_enabled():
                     # If DBO is being used, register the hook with the ubatch
@@ -1307,6 +1316,33 @@ class FusedMoEKernelModularImpl:
         # the tensor.numel() == 0 case.
         if M_full == 0:
             return torch.empty_like(a1q, dtype=in_dtype)
+
+        chunk_limit = getattr(self.fused_experts, "max_tokens_per_chunk", 0)
+        if chunk_limit > 0 and M_full > chunk_limit:
+            if a1q_scale is not None or a1q.ndim != 2:
+                raise RuntimeError("Received-token chunks support unquantized HT only")
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Chunked HT experts cannot run inside graph capture")
+            # Each recursive call returns a scratch-backed view. Copy it before
+            # the next chunk reuses that workspace; combine all tokens only once.
+            result = torch.empty((M_full, K), device=a1q.device, dtype=in_dtype)
+            for start in range(0, M_full, chunk_limit):
+                stop = min(start + chunk_limit, M_full)
+                chunk = self._fused_experts(
+                    in_dtype, a1q[start:stop], None, w1, w2,
+                    topk_weights[start:stop], topk_ids[start:stop], activation,
+                    global_num_experts, local_num_experts, expert_map,
+                    apply_router_weight_on_input, None,
+                )
+                result[start:stop].copy_(chunk)
+            return result
+
+        # Backends may refresh post-dispatch metadata before sizing buffers.
+        prepare_metadata = getattr(self.fused_experts, "prepare_workspace_metadata", None)
+        if prepare_metadata is not None:
+            expert_tokens_meta = prepare_metadata(
+                topk_ids, local_num_experts, expert_map, expert_tokens_meta
+            )
 
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,
@@ -1493,6 +1529,8 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
             prequanted_a1_scale=scale,
             prequanted_a1=quanted_hidden_states is not None,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
         )
 
         # Stash the original unquantized hidden states on the LoRA context

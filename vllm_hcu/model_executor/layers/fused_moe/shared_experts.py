@@ -5,6 +5,7 @@
 """HCU-owned v0.25.1 shared-expert execution."""
 
 import inspect
+import os
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -25,7 +26,7 @@ from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.hcu.shared_experts")
 
 
 class SharedExpertsOrder(IntEnum):
@@ -61,10 +62,28 @@ class SharedExperts(torch.nn.Module):
         self._output: list[torch.Tensor | None] = [None, None]
         self._output_pending_on_stream: list[bool] = [False, False]
         self._layer = layer
+        self._split_dispatch_act: torch.Tensor | None = None
+        self._step5_split_overlap = (
+            os.environ.get("VLLM_STEP5_SHARED_EXPERT_SPLIT_OVERLAP", "0") == "1"
+        )
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
         self._is_multistream_safe = is_multistream_safe
+
+        self._step5_decode_only = (
+            os.environ.get("VLLM_STEP5_SHARED_EXPERTS_DECODE_ONLY", "0") == "1"
+        )
+        if self._step5_decode_only:
+            from vllm.config import get_current_vllm_config_or_none
+            config = get_current_vllm_config_or_none()
+            if (config is None
+                or config.model_config.hf_text_config.model_type != "step5"):
+                raise ValueError("Decode-only shared-expert overlap requires Step5")
+            logger.info_once(
+                "Step5 shared-expert overlap limited to uniform query lengths 1--4",
+                scope="local",
+            )
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -79,6 +98,91 @@ class SharedExperts(torch.nn.Module):
             self._stream = aux_stream()
             if self._stream is not None:
                 logger.debug_once("Enabled separate cuda stream for MoE shared_experts")
+
+        if self._step5_split_overlap:
+            from vllm.config import get_current_vllm_config_or_none
+            config = get_current_vllm_config_or_none()
+            parallel = None if config is None else config.parallel_config
+            profile_supported = False
+            self._step5_split_auto = False
+            if parallel is not None:
+                tp_dp_dcp = (
+                    parallel.tensor_parallel_size,
+                    parallel.data_parallel_size,
+                    parallel.decode_context_parallel_size,
+                )
+                profile_supported = (
+                    tp_dp_dcp in ((2, 4, 1), (2, 4, 2), (4, 2, 1))
+                )
+                from vllm_hcu.patch.config import get_hcu_config
+                self._step5_split_auto = bool(
+                    getattr(parallel, "_vllm_hcu_deepep_auto", False)
+                    or get_hcu_config(config).deepep_auto
+                )
+            if (
+                config is None
+                or config.model_config.hf_text_config.model_type != "step5"
+                or not profile_supported
+                or parallel.pipeline_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+                or not parallel.enable_expert_parallel
+                or parallel.all2all_backend != "deepep_low_latency"
+                or enable_dbo or parallel.enable_dbo
+                or self._stream is not None
+                or not getattr(layer, "_hcu_split_shared_supported", False)
+            ):
+                raise ValueError(
+                    "Step5 split shared overlap requires BF16 shared expert, "
+                    "TP2/DP4/EP8/DCP1-or-2 or TP4/DP2/EP8/DCP1, "
+                    "PP1/PCP1, DeepEP-LL (including Auto), no DBO "
+                    "and no auxiliary shared-expert stream"
+                )
+            logger.info_once(
+                "Step5 split shared-expert overlap enabled", scope="process"
+            )
+
+    def maybe_begin_dispatch(
+        self, shared_experts_input: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> bool:
+        """Run shared gate/up while the asynchronous dispatch is in flight."""
+        if not getattr(self, "_step5_split_overlap", False):
+            return False
+        if (
+            self.enable_dbo or self._stream is not None
+            or x_and_scale_quanted is not None
+            or shared_experts_input.dtype != torch.bfloat16
+            or not 1 <= shared_experts_input.shape[0] <= 64
+            or self._determine_shared_experts_order(shared_experts_input)
+                != SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+        ):
+            return False
+        from vllm.forward_context import (
+            get_forward_context, is_forward_context_available,
+        )
+        from .step5_overlap import is_short_uniform_decode
+        context = (
+            get_forward_context() if is_forward_context_available() else None
+        )
+        if not is_short_uniform_decode(context):
+            return False
+        if (
+            getattr(self, "_step5_split_auto", False)
+            and not getattr(context, "deepep_auto_use_low_latency", False)
+        ):
+            # A local short query is insufficient when another DP rank is
+            # prefilling. Only the globally selected LL forward can split.
+            return False
+        assert self._split_dispatch_act is None
+        assert self._output[self._output_idx] is None
+        self._split_dispatch_act = self._layer._hcu_shared_dispatch(
+            shared_experts_input
+        )
+        logger.info_once(
+            "Step5 split shared dispatch executed: local M=%s",
+            shared_experts_input.shape[0], scope="local",
+        )
+        return True
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
@@ -137,6 +241,9 @@ class SharedExperts(torch.nn.Module):
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
         #   - we are using flashinfer with DP, since there nothing to gain
+        return self._baseline_disables_overlap()
+
+    def _baseline_disables_overlap(self) -> bool:
         parallel_config = self._moe_config.moe_parallel_config
         return (
             parallel_config.enable_eplb
@@ -154,6 +261,27 @@ class SharedExperts(torch.nn.Module):
                 or henvs.VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE
             )
         )
+        if getattr(self, "_step5_decode_only", False):
+            from vllm.forward_context import (
+                get_forward_context, is_forward_context_available,
+            )
+            from .step5_overlap import is_short_uniform_decode
+            context = (
+                get_forward_context() if is_forward_context_available() else None
+            )
+            if not is_short_uniform_decode(context):
+                # Restrict only the new aux-stream schedule. Preserve native
+                # shared/combine overlap when the async backend supports it.
+                if (
+                    not self._baseline_disables_overlap()
+                    and self._mk_can_overlap_shared_experts()
+                ):
+                    logger.info_once(
+                        "Step5 non-short batch retains MK-internal shared/combine overlap",
+                        scope="local",
+                    )
+                    return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+                return SharedExpertsOrder.NO_OVERLAP
         if force_stream and self._stream is None:
             raise RuntimeError(
                 "HCU shared-expert stream mode was explicitly enabled, but no "
@@ -170,6 +298,11 @@ class SharedExperts(torch.nn.Module):
             and should_run_shared_in_aux_stream
             and self._is_multistream_safe()
         ):
+            if getattr(self, "_step5_decode_only", False):
+                logger.info_once(
+                    "Step5 decode-only shared experts selected the auxiliary stream",
+                    scope="local",
+                )
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
 
         if self._mk_can_overlap_shared_experts():
@@ -281,6 +414,7 @@ class SharedExperts(torch.nn.Module):
 
     @property
     def output(self) -> torch.Tensor:
+        assert getattr(self, "_split_dispatch_act", None) is None
         assert self._output[self._output_idx] is not None
         if self._output_pending_on_stream[self._output_idx]:
             assert self._stream is not None
@@ -296,6 +430,16 @@ class SharedExperts(torch.nn.Module):
         order: SharedExpertsOrder,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
+        if getattr(self, "_split_dispatch_act", None) is not None:
+            assert order == SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+            assert x_and_scale_quanted is None
+            assert self._output[self._output_idx] is None
+            self._output[self._output_idx] = self._layer._hcu_shared_combine(
+                self._split_dispatch_act
+            )
+            self._split_dispatch_act = None
+            return None
+
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if order != experts_order:

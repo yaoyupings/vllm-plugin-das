@@ -7,6 +7,15 @@ from vllm import ModelRegistry
 
 
 def register_model():
+    ModelRegistry.register_model("Step5MTP", "vllm_hcu.models.step5_mtp:Step5MTP")
+    ModelRegistry.register_model(
+        "Step5ForCausalLM", "vllm_hcu.models.step5:Step5ForCausalLM"
+    )
+    ModelRegistry.register_model(
+        "Step5ForConditionalGeneration",
+        "vllm_hcu.models.step5:Step5ForConditionalGeneration",
+    )
+
     ModelRegistry.register_model(
         "DeepseekV3ForCausalLM", "vllm_hcu.models.deepseek_v2:DeepseekV3ForCausalLM"
     )

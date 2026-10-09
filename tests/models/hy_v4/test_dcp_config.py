@@ -191,3 +191,15 @@ def test_platform_config_hook_rejects_hy4_dcp_before_later_binding(
         patch_vllm_config.validate_and_update_hcu_config(
             make_dcp_config(kv_dtype="bfloat16")
         )
+
+
+def test_model_free_config_is_outside_hy4_dcp_scope():
+    from types import SimpleNamespace
+    from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
+
+    for dcp in (1, 2):
+        config = SimpleNamespace(
+            model_config=None,
+            parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        )
+        assert validate_hy4_dcp_config(config) is False

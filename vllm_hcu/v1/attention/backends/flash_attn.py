@@ -1036,6 +1036,51 @@ class FlashAttentionImpl(AttentionImpl):
                         f"[HCU FLASH_ATTN PATH] {path_name}",
                         scope="local",
                     )
+                    # Relative causal/window coordinates are unchanged when
+                    # the discarded prefix is removed on a page boundary.
+                    # Only Step5 SWA prefill uses this bounded conversion path.
+                    import os
+                    if (
+                        os.getenv("VLLM_STEP5_SWA_PREFILL_CROP", "0") == "1"
+                        and type(layer).__name__ == "Step5FlashAttention"
+                        and attn_metadata.causal
+                        and self.sinks is None
+                        and self.alibi_slopes is None
+                        and sliding_window_size[0] >= 0
+                        and sliding_window_size[1] == 0
+                        and max_seqlen_q > 1
+                        and (key_cache.shape[1] == 64 or key_cache.shape[2] == 64)
+                        and not torch.cuda.is_current_stream_capturing()
+                    ):
+                        from .step5_swa_prefill_crop import crop_sliding_paged_kv
+                        seqused_k, block_table, max_seqlen_k = crop_sliding_paged_kv(
+                            seqused_k, cu_seqlens_q, block_table,
+                            max_seqlen_q, max_seqlen_k, sliding_window_size[0], 64,
+                        )
+                    if (
+                        os.getenv("VLLM_STEP5_SWA_REUSE_WORKSPACE", "0") == "1"
+                        and type(layer).__name__ == "Step5FlashAttention"
+                        and attn_metadata.causal
+                        and self.sinks is None and self.alibi_slopes is None
+                        and self.logits_soft_cap == 0
+                        and self.kv_cache_dtype == "auto"
+                        and self.dcp_world_size == 1 and not self.use_pcp
+                        and _get_flash_attn_mode() == "varlen"
+                    ):
+                        from .step5_swa_workspace import (
+                            eligible, native_swa_varlen_with_workspace,
+                        )
+                        if eligible(
+                            query[:num_actual_tokens], key_cache, value_cache,
+                            cu_seqlens_q, max_seqlen_q, sliding_window_size,
+                        ):
+                            native_swa_varlen_with_workspace(
+                                query[:num_actual_tokens], key_cache, value_cache,
+                                output[:num_actual_tokens], cu_seqlens_q,
+                                seqused_k, block_table, max_seqlen_q,
+                                max_seqlen_k, self.scale, sliding_window_size,
+                            )
+                            return output
                     _select_flash_attn_varlen_func()(
                         q=query[:num_actual_tokens],
                         k=key_cache,

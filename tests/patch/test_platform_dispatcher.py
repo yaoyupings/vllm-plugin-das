@@ -75,6 +75,10 @@ def test_target_root_is_installed_vllm():
 def test_platform_core_inventory_is_explicit_and_ordered():
     assert platform_core_callback_names() == (
         ("platform.core_fix.envs", "vllm.envs"),
+        ("platform.core_fix.step5_config", "vllm.transformers_utils.config"),
+        ("platform.core_fix.step5_mtp", "vllm.config.speculative"),
+        ("platform.core_fix.step5_multi_mtp", "vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator"),
+        ("platform.core_fix.step5_kv_cache", "vllm.v1.worker.gpu.model_runner"),
         ("platform.core_fix.engram_config.hcu", "vllm.config.engram"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
         (
@@ -138,6 +142,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.v1.core.kv_cache_utils",
         ),
         (
+            "platform.framework_opt.step5_dcp2_cache_utils",
+            "vllm.v1.core.kv_cache_utils",
+        ),
+        (
             "platform.framework_opt.qwen4_exp_mtp_kv_cache_groups",
             "vllm.v1.core.kv_cache_utils",
         ),
@@ -155,6 +163,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         ),
         (
             "platform.framework_opt.mtp_indexer_kv_cache_coordinator",
+            "vllm.v1.core.kv_cache_coordinator",
+        ),
+        (
+            "platform.framework_opt.step5_dcp2_cache",
             "vllm.v1.core.kv_cache_coordinator",
         ),
         (
@@ -390,9 +402,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 47,
+        "count": 53,
         "replacements": 11,
-        "callbacks": 36,
+        "callbacks": 42,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
