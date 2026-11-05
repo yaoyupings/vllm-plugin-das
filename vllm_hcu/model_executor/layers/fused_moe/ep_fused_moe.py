@@ -490,9 +490,10 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                      w1_scale, w2_scale, a1_scale=None, global_num_experts=-1,
                      output_dtype=None, gemm1_limit=None, routed_scaling_factor=1.0,
                      configs=None, expert_mask=None, out=None, workspace13=None,
-                     workspace2=None, preserve_chunk_output=None):
+                     workspace2=None, sort_fn=None, preserve_chunk_output=None):
     # out/workspace13/workspace2: caller-owned buffers (vLLM modular-kernel workspaces).
     # cache1 then cache3 live in workspace13, act_q in workspace2.
+    # sort_fn: replaces ep_sorting (same signature/returns), see ep_replica.
     out_dtype = output_dtype or (out.dtype if out is not None else hidden_states.dtype)
     compute_type = tl.bfloat16 if out_dtype == torch.bfloat16 else (
         tl.float16 if out_dtype == torch.float16 else tl.float32)
@@ -533,7 +534,7 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                 print("[step5_expert_grid] active: E22 M256 BM16 workers4", flush=True)
     sorting_args = (topk_ids, topk_weights, expert_mask, G, E, bm, expert_map)
     if expert_layout is None:
-        sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(*sorting_args)
+        sorted_ids, sorted_w, expert_ids, nvalid, rows = (sort_fn or ep_sorting)(*sorting_args)
     else:
         sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(
             *sorting_args, expert_layout=expert_layout)

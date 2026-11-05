@@ -325,6 +325,10 @@ def apply_to_module(module: ModuleType) -> bool:
                 w13_scale = w13_scale.squeeze(-1).contiguous()
             if w2_scale.ndim == 3 and w2_scale.size(-1) == 1:
                 w2_scale = w2_scale.squeeze(-1).contiguous()
+            if ep_fused:
+                from vllm_hcu.model_executor.layers.fused_moe import ep_replica
+
+                w13, w2 = ep_replica.attach(layer, w13, w2, w13_scale, w2_scale)
             return w13, w2, w13_scale, w2_scale
         return convert(
             fp8_backend,

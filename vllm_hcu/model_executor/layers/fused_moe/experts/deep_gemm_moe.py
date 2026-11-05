@@ -393,6 +393,38 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             act_out, block_k, column_major_scales=True, out_q=output
         )
 
+    def _apply_ep_replica(self, rep, output, a1q, w1, w2, topk_weights, topk_ids,
+                          a1q_scale, workspace13, workspace2):
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
+            _ep_fused_experts,
+            pick_configs,
+        )
+
+        tabs = rep.tabs
+        ids = topk_ids.to(torch.int32).contiguous()
+        lids = torch.empty_like(ids)
+        _ep_fused_experts(
+            a1q,
+            rep.w1,
+            rep.w2,
+            topk_weights.to(torch.float32).contiguous(),
+            lids,
+            tabs.emap,
+            rep.w1_scale,
+            rep.w2_scale,
+            a1_scale=a1q_scale,
+            global_num_experts=tabs.nloc + 1,
+            output_dtype=output.dtype,
+            gemm1_limit=float(self.gemm1_clamp_limit or 7.0),
+            # the tuned table is keyed by the home expert count
+            configs=pick_configs(w1, w2, ids.shape[1], a1q.shape[0]),
+            expert_mask=tabs.mask,
+            out=output,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            sort_fn=tabs.sort_fn(ids, lids),
+        )
+
     def _apply_ep_fused(
         self, output, a1q, w1, w2, topk_weights, topk_ids, activation,
         global_num_experts, expert_map, a1q_scale, workspace13, workspace2,
@@ -427,6 +459,16 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
             ep_fused_experts,
         )
+
+        from vllm_hcu.model_executor.layers.fused_moe import ep_replica
+
+        if ep_replica.ENABLED:
+            # built at load by ep_replica.attach (fp8 oracle weight conversion)
+            rep = ep_replica.STATES.get(w1.data_ptr())
+            if rep is not None and topk_ids.numel() <= ep_replica.MAX_ROUTES:
+                self._apply_ep_replica(rep, output, a1q, w1, w2, topk_weights, topk_ids,
+                                       a1q_scale, workspace13, workspace2)
+                return
 
         mask = getattr(self, "_ep_fused_mask", None)
         if mask is None or self._ep_fused_mask_src is not expert_map:
