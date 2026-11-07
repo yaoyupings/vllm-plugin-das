@@ -220,6 +220,171 @@ def ep_swiglustep_quant(cache1, sorted_weights, nvalid, rows, limit=7.0, q=None)
     return q, scale
 
 
+@triton.jit
+def _ep_swiglustep_quant_routes_kernel(
+    q_ptr, scale_ptr, in_ptr, sids_ptr, nvalid_ptr, M,
+    D: tl.constexpr, LIMIT: tl.constexpr, DTYPE_MAX: tl.constexpr,
+    BLOCK_M: tl.constexpr, CH: tl.constexpr, TOPK: tl.constexpr,
+):
+    # _ep_swiglustep_quant_kernel for the moe_c route layout: the sorted rows below
+    # nvalid name routes (tok | k << 24); input, q and scale rows are routes t*TOPK+k.
+    # The router weight stays out of the scale (moe_c GEMM2 applies topk_weights).
+    tl.static_assert(D == 3 * CH)
+    n = tl.load(nvalid_ptr)
+    cols = tl.arange(0, CH)
+    step = tl.num_programs(0) * BLOCK_M
+    for start in range(tl.program_id(0) * BLOCK_M, n, step):
+        p = start + tl.arange(0, BLOCK_M)
+        sid = tl.load(sids_ptr + p, mask=p < n, other=M)
+        tok = sid & 0xFFFFFF
+        row_mask = (p < n) & (tok < M)
+        rows = tok * TOPK + (sid >> 24)
+        m2 = row_mask[:, None]
+        offs = rows[:, None].to(tl.int64) * (2 * D) + cols[None, :]
+        y0 = _ep_swiglu_chunk(in_ptr, offs, m2, LIMIT, D)
+        y1 = _ep_swiglu_chunk(in_ptr, offs + CH, m2, LIMIT, D)
+        y2 = _ep_swiglu_chunk(in_ptr, offs + 2 * CH, m2, LIMIT, D)
+        absmax = tl.maximum(tl.maximum(tl.max(tl.abs(y0), axis=-1), tl.max(tl.abs(y1), axis=-1)),
+                            tl.max(tl.abs(y2), axis=-1))
+        scale = tl.maximum(absmax.to(tl.float32), 1.0e-10) / DTYPE_MAX
+        inv = (1.0 / scale)[:, None]
+        q_offs = rows[:, None].to(tl.int64) * D + cols[None, :]
+        tl.store(q_ptr + q_offs, (y0 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(q_ptr + q_offs + CH, (y1 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(q_ptr + q_offs + 2 * CH, (y2 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(scale_ptr + rows, scale, mask=row_mask)
+
+
+def ep_swiglustep_quant_routes(cache1, sorted_ids, nvalid, rows, limit=7.0, q=None):
+    """cache1: [M, topk, 2D] GEMM1 output by route -> (q [M*topk, D] fp8, scale [M*topk, 1])."""
+    M, topk, D2 = cache1.shape
+    D = D2 // 2
+    if q is None:
+        q = torch.empty((M * topk, D), dtype=FP8, device=cache1.device)
+    scale = torch.empty((M * topk, 1), dtype=torch.float32, device=cache1.device)
+    bm = ACT_CFG["BLOCK_M"]
+    grid = (max(1, min(triton.cdiv(rows, bm), _num_cus(cache1.device.index) * ACT_CFG["CTAS_PER_CU"])),)
+    assert D % 3 == 0 and triton.next_power_of_2(D // 3) == D // 3
+    _ep_swiglustep_quant_routes_kernel[grid](
+        q, scale, cache1, sorted_ids, nvalid, M,
+        D=D, LIMIT=float(limit), DTYPE_MAX=torch.finfo(FP8).max,
+        BLOCK_M=bm, CH=D // 3, TOPK=topk, num_warps=ACT_CFG["num_warps"], num_stages=1)
+    return q, scale
+
+
+# VLLM_HCU_EP_MOEC=1: decode MoE GEMMs (M <= VLLM_HCU_EP_MOEC_MAX_M) run the moe_c fp8
+# per-channel marlin decode kernels (aiter 3rdparty/moe_c, built standalone; ~1.65 vs
+# ~1.45 TB/s for the boltops persistent kernel on real EP8 decode routing). Their weight
+# layout is shuffled into 16(n) x 64(k) tiles in place at load (moec_prepare); larger M
+# runs the boltops kernel with its B addressing patched to that layout (_moec_launcher).
+MOEC = os.environ.get("VLLM_HCU_EP_MOEC", "0") == "1"
+MOEC_MAX_M = int(os.environ.get("VLLM_HCU_EP_MOEC_MAX_M", "256"))
+MOEC_MODES = tuple(int(v) for v in os.environ.get("VLLM_HCU_EP_MOEC_MODES",
+                                                  "10001103,20001101").split(","))
+MOEC_LIB = os.environ.get("VLLM_HCU_EP_MOEC_LIB", "/public/home/public_user/yyp/step5_vllm028/moec_lib")
+MOEC_BM = 16
+_moec_ptrs = set()
+
+
+@functools.lru_cache(maxsize=None)
+def _moec_op():
+    for lib in ("libmoe_c_common.so", "libmoe_w8a8_fp8.so"):
+        torch.ops.load_library(os.path.join(MOEC_LIB, lib))
+    return torch.ops.moe_wna16.moe_c_moe_gemm_marlin_w8a8_fp8
+
+
+def _moec_tiles(w):
+    """[E, N, K] (k contiguous) viewed as [E, N/16, 16, K/64, 4, 16]."""
+    E, N, K = w.shape
+    assert N % 16 == 0 and K % 64 == 0
+    return w.view(torch.uint8).view(E, N // 16, 16, K // 64, 4, 16)
+
+
+def moec_prepare(w1, w2):
+    """Shuffle w1 [E, 2I, H] and w2 [E, H, I] in place into the moe_c marlin layout
+    (moe_layout_shuffle_gemm2): [E][k/64][n/16][(k%64)/16][n%16][k%16]."""
+    if not MOEC:
+        return
+    _moec_op()
+    for w in (w1, w2):
+        if w.data_ptr() in _moec_ptrs:
+            continue
+        E, N, K = w.shape
+        t = _moec_tiles(w)
+        for e in range(E):
+            w.view(torch.uint8)[e].copy_(t[e].permute(2, 0, 3, 1, 4).contiguous().view(N, K))
+        _moec_ptrs.add(w.data_ptr())
+
+
+@triton.jit
+def _moec_b_off(offs_k, offs_n, stride_bk):
+    # Element offset of B[k, n] in the moe_c layout; stride_bk carries N (see _moec_bview).
+    k = offs_k[:, None]
+    n = offs_n[None, :]
+    # (k // 16) % 4, not (k % 64) // 16: Triton's axis analysis loses the 16-byte
+    # contiguity of the latter once a tile spans 64-k blocks (byte loads, ~15x slower).
+    return (k % 16 + (n % 16) * 16 + ((k // 16) % 4) * 256 + (n // 16) * 1024
+            + (k // 64) * (stride_bk * 64))
+
+
+@functools.lru_cache(maxsize=None)
+def _moec_launcher():
+    """boltops fused_moe with its fused_moe_kernel B addressing patched to the moe_c layout.
+    The K-tile advance (BLOCK_SIZE_K * stride_bk) stays valid for BLOCK_SIZE_K % 64 == 0."""
+    import linecache
+    import re
+    import types
+    src = _moe_op.fused_moe_kernel.fn.src
+    src, n = re.subn(r"offs_k\[:, None\](\.to\(tl\.int64\))? \* stride_bk\s*"
+                     r"\+ offs_bn\[None, :\](\.to\(tl\.int64\))? \* stride_bn",
+                     lambda m: "_moec_b_off(offs_k%s, offs_bn%s, stride_bk)" % (
+                         m.group(1) or "", m.group(2) or ""), src)
+    assert n == 4, f"boltops fused_moe_kernel changed: {n} B address sites"
+    fname = "<vllm_hcu ep_fused_moe moec fused_moe_kernel>"
+    linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
+    ns = dict(vars(_moe_op), _moec_b_off=_moec_b_off, _USE_MOE_PERSISTENT_KERNEL=False)
+    exec(compile(src, fname, "exec"), ns)
+    ns["fused_moe_kernel"] = triton.heuristics(values=_moe_op.fused_moe_kernel.values)(
+        triton.jit(repr=_moe_op._fused_moe_kernel_repr)(ns["fused_moe_kernel"]))
+    f = _moe_op.fused_moe
+    return types.FunctionType(f.__code__, ns, f.__name__, f.__defaults__, f.__closure__)
+
+
+def _moec_bview(w):
+    """[E, N, K] view of a moe_c-shuffled weight whose strides make the launcher pass
+    stride_bk = N, stride_bn = 1."""
+    E, N, K = w.shape
+    return w.as_strided((E, N, K), (N * K, 1, N))
+
+
+def _moec_experts(a_q, a_s, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, expert_mask,
+                  expert_map, G, out_dtype, gemm1_limit, routed_scaling_factor, out,
+                  workspace13, workspace2, sort_fn):
+    op = _moec_op()
+    M, topk = topk_ids.shape
+    E, N, H = w1.shape
+    dev = a_q.device
+    sids, _, eids, nvalid, rows = (sort_fn or ep_sorting)(
+        topk_ids, topk_weights, expert_mask, G, E, MOEC_BM, expert_map)
+    s1 = w1_scale.view(E, N, 1)
+    s2 = w2_scale.view(E, H, 1)
+    a_s = a_s.view(M, 1) if a_s.numel() == M else a_s.expand(M, 1).contiguous()
+    cache1 = _carve(workspace13, (M, topk, N), out_dtype, dev)
+    op(a_q, w1, cache1, a_s, s1, None, sids, eids, nvalid, topk, MOEC_MODES[0], topk, M, H)
+    act_q, act_s = ep_swiglustep_quant_routes(
+        cache1, sids, nvalid, rows, 7.0 if gemm1_limit is None else gemm1_limit,
+        q=_carve(workspace2, (M * topk, N // 2), FP8, dev))
+    del cache1
+    cache3 = _carve(workspace13, (M, topk, H), out_dtype, dev)
+    op(act_q, w2, cache3, act_s, s2, topk_weights.float().contiguous(), sids, eids, nvalid, 1,
+       MOEC_MODES[1], topk, M, N // 2)
+    if out is None:
+        out = torch.empty((M, H), dtype=out_dtype, device=dev)
+    add = shared_add_provider(out) if shared_add_provider is not None else None
+    ep_masked_moe_sum(cache3, out, topk_ids, expert_map, routed_scaling_factor, *(add or ()))
+    return out
+
+
 def ep_masked_moe_sum(cache3, out, topk_ids, expert_map, scale=1.0, add=None, add_start=0):
     """out[t] = scale * sum of the local-expert routes of token t, plus
     add[t - add_start] for the rows add covers."""
@@ -408,16 +573,20 @@ def _gemm(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, sorted_
         return invoke_expert_grid(
             A, B, C, A_scale, B_scale, sorted_ids, expert_layout, topk_ids, config,
             a_sorted=kw.get("a_sorted", False), c_sorted=kw.get("c_sorted", False))
+    launch = invoke_fused_moe_kernel
+    if B.data_ptr() in _moec_ptrs:
+        assert config["BLOCK_SIZE_K"] % 64 == 0 and "PERSISTENT_PROGRAMS" not in config
+        launch, B, config = _moec_launcher(), _moec_bview(B), {**config, "USE_MLS_LOAD": False}
     if "PERSISTENT_PROGRAMS" in config:
         kw.pop("scale_bias_with_routed_weight", None)  # only acts on a bias; there is none
         _invoke_persistent(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids,
                            sorted_w, expert_ids, nvalid, top_k, compute_type, config=config,
                            **{k: v for k, v in kw.items() if k != "ck_sorting"})
         return
-    invoke_fused_moe_kernel(A, B, C, A_scale, B_scale, None, topk_weights, topk_ids,
-                            sorted_ids, sorted_w, expert_ids, nvalid, False, top_k,
-                            compute_type=compute_type, use_fp8_w8a8=True,
-                            per_channel_quant=True, config=config, **kw)
+    launch(A, B, C, A_scale, B_scale, None, topk_weights, topk_ids,
+           sorted_ids, sorted_w, expert_ids, nvalid, False, top_k,
+           compute_type=compute_type, use_fp8_w8a8=True,
+           per_channel_quant=True, config=config, **kw)
 
 
 # Largest M per call; vLLM's MoE chunk size, so normally a single chunk.
@@ -504,6 +673,15 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     G = global_num_experts if global_num_experts > 0 else expert_map.numel()
     if expert_mask is None:
         expert_mask = (expert_map >= 0).to(torch.int32)
+    if w1.data_ptr() in _moec_ptrs:
+        if M <= MOEC_MAX_M and out_dtype in (torch.bfloat16, torch.float16):
+            if hidden_states.dtype in (torch.bfloat16, torch.float16):
+                a_q, a_s = per_token_quant_triton(hidden_states, quant_dtype=FP8)
+            else:
+                a_q, a_s = hidden_states, a1_scale
+            return _moec_experts(a_q, a_s, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
+                                 expert_mask, expert_map, G, out_dtype, gemm1_limit,
+                                 routed_scaling_factor, out, workspace13, workspace2, sort_fn)
     cfg1, cfg2 = configs if configs is not None else pick_configs(w1, w2, topk, M)
     bm = cfg1["BLOCK_SIZE_M"]
     assert cfg2["BLOCK_SIZE_M"] == bm

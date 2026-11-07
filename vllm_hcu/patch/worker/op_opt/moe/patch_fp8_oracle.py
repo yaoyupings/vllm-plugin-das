@@ -329,6 +329,11 @@ def apply_to_module(module: ModuleType) -> bool:
                 from vllm_hcu.model_executor.layers.fused_moe import ep_replica
 
                 w13, w2 = ep_replica.attach(layer, w13, w2, w13_scale, w2_scale)
+                from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe
+
+                # moe_c decode layout, in place (replica slots included)
+                rep = ep_replica.STATES.get(w13.data_ptr())
+                ep_fused_moe.moec_prepare(*((rep.w1, rep.w2) if rep is not None else (w13, w2)))
             return w13, w2, w13_scale, w2_scale
         return convert(
             fp8_backend,
