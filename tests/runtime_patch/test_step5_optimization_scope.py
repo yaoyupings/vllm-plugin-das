@@ -35,6 +35,9 @@ def test_skinny_head_requires_step5_opt_in(
             calls.append("native")
             return "native"
 
+        def get_top_tokens(self, lm_head, hidden_states, embedding_bias=None):
+            return "native"
+
     class Unquantized:
         pass
 
@@ -69,6 +72,9 @@ def test_skinny_head_master_off_uses_native_without_probing_provider(monkeypatch
         _step5_skinny_lm_head = True
 
         def _apply_head(self, lm_head, hidden_states, embedding_bias=None):
+            return "native"
+
+        def get_top_tokens(self, lm_head, hidden_states, embedding_bias=None):
             return "native"
 
     class Unquantized:

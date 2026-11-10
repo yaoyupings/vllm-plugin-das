@@ -1298,6 +1298,109 @@ def _region_topk_ids_resident_kernel(
 
 
 @triton.jit
+def _resident_keys(logits_ptr, row, stride_logits_row, regions, visible):
+    live = regions < visible
+    scores = tl.load(
+        logits_ptr + row * stride_logits_row + regions, mask=live, other=0.0
+    )
+    bits = scores.to(tl.int32, bitcast=True)
+    keys = tl.where(scores < 0.0, bits ^ 0x7FFFFFFF, bits & 0x7FFFFFFF)
+    return tl.where(live, keys, -2147483648), live
+
+
+@triton.jit
+def _region_topk_ids_resident2_kernel(
+    logits_ptr,
+    lengths_ptr,
+    out_ptr,
+    seq_regions,
+    stride_logits_row,
+    stride_out_row,
+    topk: tl.constexpr,
+    BLOCK_A: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    """:func:`_region_topk_ids_resident_kernel` for a row held as two register tiles.
+
+    Tile A is regions ``[0, BLOCK_A)``, tile B ``[BLOCK_A, BLOCK_A + BLOCK_B)``, so a row
+    just past a power of two is not padded to the next one: a 128K-context decode graph
+    (16960 regions) costs 16384 + 1024 lanes instead of 32768. Every reduction is taken
+    over both tiles and tile B's emit prefix starts from tile A's totals, so the output
+    is the same bit for bit. Rows are still limited to ``< 2**15`` regions by the packed
+    cumsum. 180 -> 69us at 64 rows x 16960 regions (tiled radix kernel -> this).
+    """
+    row = tl.program_id(0)
+    visible = tl.load(lengths_ptr + row).to(tl.int32)
+    visible = tl.minimum(tl.maximum(visible, 0), seq_regions)
+
+    budget = tl.minimum(topk, visible)
+    slots = tl.arange(0, BLOCK_TOPK)
+    tl.store(
+        out_ptr + row * stride_out_row + slots, -1, mask=(slots >= budget) & (slots < topk)
+    )
+    if visible <= 0:
+        return
+
+    regions_a = tl.arange(0, BLOCK_A)
+    regions_b = BLOCK_A + tl.arange(0, BLOCK_B)
+    keys_a, live_a = _resident_keys(logits_ptr, row, stride_logits_row, regions_a, visible)
+    keys_b, live_b = _resident_keys(logits_ptr, row, stride_logits_row, regions_b, visible)
+
+    lo = tl.minimum(
+        tl.min(tl.where(live_a, keys_a, 2147483647)),
+        tl.min(tl.where(live_b, keys_b, 2147483647)),
+    ).to(tl.int64)
+    hi = tl.maximum(tl.max(keys_a), tl.max(keys_b)).to(tl.int64) + 1
+    done = budget * 0
+    while (hi - lo > 1) & (done == 0):
+        mid = lo + (hi - lo) // 2
+        above_a = keys_a >= mid.to(tl.int32)
+        above_b = keys_b >= mid.to(tl.int32)
+        count = tl.sum(above_a.to(tl.int32)) + tl.sum(above_b.to(tl.int32))
+        if count == budget:
+            lo = tl.minimum(
+                tl.min(tl.where(above_a, keys_a, 2147483647)),
+                tl.min(tl.where(above_b, keys_b, 2147483647)),
+            ).to(tl.int64)
+            done = 1
+        elif count > budget:
+            lo = mid
+        else:
+            hi = mid
+    threshold = lo.to(tl.int32)
+
+    greater_a = live_a & (keys_a > threshold)
+    tied_a = live_a & (keys_a == threshold)
+    greater_b = live_b & (keys_b > threshold)
+    tied_b = live_b & (keys_b == threshold)
+    prefix_a = tl.cumsum(greater_a.to(tl.int32) | (tied_a.to(tl.int32) << 16), axis=0)
+    prefix_b = tl.cumsum(
+        greater_b.to(tl.int32) | (tied_b.to(tl.int32) << 16), axis=0
+    ) + tl.max(prefix_a)
+    remaining = budget - tl.max(prefix_b & 0xFFFF)
+
+    greater_incl = prefix_a & 0xFFFF
+    tied_incl = prefix_a >> 16
+    selected = greater_a | (tied_a & (tied_incl <= remaining))
+    positions = greater_incl + tl.minimum(tied_incl, remaining) - 1
+    tl.store(
+        out_ptr + row * stride_out_row + positions,
+        regions_a,
+        mask=selected & (positions < topk),
+    )
+    greater_incl = prefix_b & 0xFFFF
+    tied_incl = prefix_b >> 16
+    selected = greater_b | (tied_b & (tied_incl <= remaining))
+    positions = greater_incl + tl.minimum(tied_incl, remaining) - 1
+    tl.store(
+        out_ptr + row * stride_out_row + positions,
+        regions_b,
+        mask=selected & (positions < topk),
+    )
+
+
+@triton.jit
 def _region_topk_pack_resident_kernel(
     logits_ptr,
     lengths_ptr,
@@ -1416,6 +1519,9 @@ def _region_topk_pack_resident_kernel(
 
 # Widest row the register-resident selector takes; wider rows use the tiled radix one.
 _RESIDENT_TOPK_MAX_REGIONS = 16384
+# Decode rows up to here (exclusive; the packed emit cumsum needs < 2**15) are held as
+# two resident tiles instead, e.g. a 128K-context graph width of 16960 regions.
+_RESIDENT2_TOPK_MAX_REGIONS = 2**15
 
 
 def region_topk_ids(
@@ -1454,6 +1560,22 @@ def region_topk_ids(
             # HCU: >= 2 for the same reason as below.
             BLOCK_R=max(2, triton.next_power_of_2(seq_regions)),
             BLOCK_TOPK=triton.next_power_of_2(int(topk)),
+            num_warps=8,
+        )
+        return out
+    if seq_regions < _RESIDENT2_TOPK_MAX_REGIONS:
+        _region_topk_ids_resident2_kernel[(rows,)](
+            logits,
+            lengths,
+            out,
+            seq_regions,
+            logits.stride(0),
+            out.stride(0),
+            topk=int(topk),
+            BLOCK_A=_RESIDENT_TOPK_MAX_REGIONS,
+            BLOCK_B=max(2, triton.next_power_of_2(seq_regions - _RESIDENT_TOPK_MAX_REGIONS)),
+            BLOCK_TOPK=triton.next_power_of_2(int(topk)),
+            # 64 rows x 16960: w8 69, w16 80us.
             num_warps=8,
         )
         return out
@@ -1548,8 +1670,9 @@ def region_topk_pack(
             BLOCK_R=block_r,
             BLOCK_TOPK=triton.next_power_of_2(int(topk)),
             # Many rows at prefill: fewer warps per row keeps more rows in flight
-            # (8K regions: w2 8.3, w4 6.7, w8 8.6 ms; 4K: w2 2.9, w4 3.1 ms).
-            num_warps=2 if block_r <= 4096 else 4,
+            # (8K regions: w2 8.3, w4 6.7, w8 8.6 ms; 4K: w2 2.9, w4 3.1 ms), until the
+            # 16K tile, where w8 wins (32K rows, 96K-128K context: w4 20.0, w8 17.3 ms).
+            num_warps=2 if block_r <= 4096 else 4 if block_r <= 8192 else 8,
         )
         return (out, _logical_out) if _logical_out is not None else out
     _region_topk_pack_kernel[(rows,)](

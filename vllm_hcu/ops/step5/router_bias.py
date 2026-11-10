@@ -68,25 +68,40 @@ def router_bias_topk_kernel(
     # Triton vector lengths must be powers of two, while the model's top-k
     # need not be. Keep selecting TOPK experts and mask the padded lanes below.
     BLOCK_TOPK: tl.constexpr = triton.next_power_of_2(TOPK)
+
+    # Pack each score and its expert id into one sortable int64 key so the top-k is TOPK
+    # plain maxima: tl.max(..., return_indices=True) is followed by a scalar global reload
+    # of the winning logit whose address depends on the reduction, so the iterations
+    # serialize into dependent memory round trips even though the value is already in
+    # gate_prob.
+    # fp32 -> uint32 total order: flip all bits of negatives, set the sign bit otherwise.
+    # The unsigned image has to be carried in an int64; done in int32 it would invert the
+    # order.
+    score_bits = scores.to(tl.int32, bitcast=True)
+    unsigned = score_bits.to(tl.int64) & 0xFFFFFFFF
+    ordered = tl.where(score_bits < 0, (~unsigned) & 0xFFFFFFFF, unsigned | 0x80000000)
+    # Low 10 bits break ties toward the lowest expert id, matching return_indices. Masked
+    # lanes are already -inf, the strict minimum of the map, so clamping their tie-break is
+    # enough. E <= 1024 keeps that field from overflowing the 10 bits (checked by the
+    # caller's block-experts bound).
+    key = (ordered << 10) | tl.maximum(E - 1 - offs_e, 0).to(tl.int64)
+
     weights = tl.zeros((BLOCK_TOPK,), dtype=tl.float32)
     indices = tl.zeros((BLOCK_TOPK,), dtype=tl.int32)
     weight_sum = 0.0
     topk_offsets = tl.arange(0, BLOCK_TOPK)
 
     for k in tl.static_range(TOPK):
-        max_score, max_index = tl.max(scores, axis=0, return_indices=True)
-        max_index = max_index.to(tl.int32)
-
-        selected_gating = tl.load(
-            gating_ptr + pid * stride_gm + max_index, mask=True, other=0
-        ).to(tl.float32)
-        selected_prob = tl.sigmoid(selected_gating)
+        max_key = tl.max(key, axis=0)
+        max_index = (E - 1 - (max_key & 1023)).to(tl.int32)
+        selected_prob = tl.sum(tl.where(offs_e == max_index, gate_prob, 0.0), axis=0)
 
         weights = tl.where(topk_offsets == k, selected_prob, weights)
         indices = tl.where(topk_offsets == k, max_index, indices)
 
         weight_sum += selected_prob
-        scores = tl.where(offs_e == max_index, -float("inf"), scores)
+        # every key is non-negative, so -1 is free as the "already taken" sentinel
+        key = tl.where(key == max_key, tl.full((1,), -1, tl.int64), key)
 
     if RENORM:
         weights = weights / (weight_sum + 1e-20)
