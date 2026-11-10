@@ -326,7 +326,25 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         assert M_sum % align_used == 0
 
         activation_out_dim = self.adjust_N_for_activation(N, activation)
-        workspace1 = (M_sum, max(activation_out_dim, K))
+        W = max(activation_out_dim, K)
+        rows1 = M_sum
+        if _EP_FUSED_MOE:
+            # The modular kernel carves the output (M, K) from workspace13's storage at
+            # offset 0, and ep_fused_moe places its route caches after it (_carve(avoid=)):
+            # the masked sum reads cache3 while writing out, and with M > CHUNK every
+            # chunk's cache1/cache3 must leave the earlier chunks' output intact.
+            from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import CHUNK
+
+            mc = min(M, CHUNK)
+            caches = mc * topk * K
+            if M > CHUNK:
+                mc_sum, _ = compute_aligned_M_and_alignment(
+                    mc, topk, local_num_experts, block_m, None
+                )
+                caches = max(caches, mc_sum * N)
+            # +128 elements: _carve rounds the start up to 256 bytes
+            rows1 = max(M_sum, -(-(M * K + 128 + caches) // W))
+        workspace1 = (rows1, W)
         workspace2 = (M_sum, max(N, K))
         output = (M, K)
         return (workspace1, workspace2, output)

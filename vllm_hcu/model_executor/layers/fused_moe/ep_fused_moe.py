@@ -359,7 +359,7 @@ def _moec_bview(w):
 
 def _moec_experts(a_q, a_s, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, expert_mask,
                   expert_map, G, out_dtype, gemm1_limit, routed_scaling_factor, out,
-                  workspace13, workspace2, sort_fn):
+                  workspace13, workspace2, sort_fn, preserve_chunk_output=None):
     op = _moec_op()
     M, topk = topk_ids.shape
     E, N, H = w1.shape
@@ -369,13 +369,14 @@ def _moec_experts(a_q, a_s, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, 
     s1 = w1_scale.view(E, N, 1)
     s2 = w2_scale.view(E, H, 1)
     a_s = a_s.view(M, 1) if a_s.numel() == M else a_s.expand(M, 1).contiguous()
-    cache1 = _carve(workspace13, (M, topk, N), out_dtype, dev)
+    cache1 = _carve(workspace13, (M, topk, N), out_dtype, dev, avoid=preserve_chunk_output)
     op(a_q, w1, cache1, a_s, s1, None, sids, eids, nvalid, topk, MOEC_MODES[0], topk, M, H)
     act_q, act_s = ep_swiglustep_quant_routes(
         cache1, sids, nvalid, rows, 7.0 if gemm1_limit is None else gemm1_limit,
         q=_carve(workspace2, (M * topk, N // 2), FP8, dev))
     del cache1
-    cache3 = _carve(workspace13, (M, topk, H), out_dtype, dev)
+    cache3 = _carve(workspace13, (M, topk, H), out_dtype, dev,
+                    avoid=out if preserve_chunk_output is None else preserve_chunk_output)
     op(act_q, w2, cache3, act_s, s2, topk_weights.float().contiguous(), sids, eids, nvalid, 1,
        MOEC_MODES[1], topk, M, N // 2)
     if out is None:
@@ -681,7 +682,8 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                 a_q, a_s = hidden_states, a1_scale
             return _moec_experts(a_q, a_s, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
                                  expert_mask, expert_map, G, out_dtype, gemm1_limit,
-                                 routed_scaling_factor, out, workspace13, workspace2, sort_fn)
+                                 routed_scaling_factor, out, workspace13, workspace2, sort_fn,
+                                 preserve_chunk_output)
     cfg1, cfg2 = configs if configs is not None else pick_configs(w1, w2, topk, M)
     bm = cfg1["BLOCK_SIZE_M"]
     assert cfg2["BLOCK_SIZE_M"] == bm
